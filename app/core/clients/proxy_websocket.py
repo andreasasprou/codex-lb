@@ -35,6 +35,7 @@ from app.core.clients.proxy import (
     ProxyResponseError,
     _is_native_codex_request,
     _normalize_non_native_upstream_fingerprint,
+    _upstream_websocket_heartbeat_seconds,
     filter_inbound_headers,
 )
 from app.core.config.settings import get_settings
@@ -502,6 +503,7 @@ async def connect_responses_websocket(
     allow_direct_egress: bool = False,
 ) -> UpstreamResponsesWebSocket:
     settings = get_settings()
+    heartbeat_seconds = _upstream_websocket_heartbeat_seconds(settings)
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = _responses_websocket_url(upstream_base)
     upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
@@ -524,6 +526,7 @@ async def connect_responses_websocket(
                     route=route,
                     headers=upstream_headers,
                     timeout=settings.upstream_connect_timeout_seconds,
+                    heartbeat=heartbeat_seconds,
                     max_msg_size=settings.max_sse_event_bytes,
                 )
                 context = result.context
@@ -537,6 +540,7 @@ async def connect_responses_websocket(
                     route=route,
                     headers=upstream_headers,
                     timeout=settings.upstream_connect_timeout_seconds,
+                    heartbeat=heartbeat_seconds,
                     max_msg_size=settings.max_sse_event_bytes,
                 )
                 websocket = await context.__aenter__() if hasattr(context, "__aenter__") else context
@@ -583,12 +587,11 @@ async def connect_responses_websocket(
         "additional_headers": upstream_headers or None,
         "user_agent_header": user_agent,
         "open_timeout": settings.upstream_connect_timeout_seconds,
-        # Long Codex turns can spend minutes in upstream reasoning without
-        # sending application frames. Keep transport pings enabled so
-        # intermediaries still see liveness, but disable the library's pong
-        # watchdog so codex-lb's own request/idle budgets decide when a
-        # healthy long turn has stalled.
-        "ping_timeout": None,
+        # Control-frame pings remain independent of long-running application
+        # reasoning. Require a matching pong so half-open bridge sockets are
+        # detected instead of retaining the response-create gate indefinitely.
+        "ping_interval": heartbeat_seconds,
+        "ping_timeout": heartbeat_seconds,
         "max_size": settings.max_sse_event_bytes,
     }
     connect_kwargs["proxy"] = proxy_url

@@ -7931,6 +7931,66 @@ async def test_stream_responses_via_websocket_counts_connect_and_send_against_to
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_heartbeat", "expected_heartbeat"),
+    [(20.0, 20.0), (0.0, None)],
+)
+async def test_stream_responses_via_websocket_configures_routed_aiohttp_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_heartbeat: float,
+    expected_heartbeat: float | None,
+) -> None:
+    websocket = _WsResponse([])
+    route = ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_heartbeat",
+        endpoint=ResolvedProxyEndpoint("ep_heartbeat", "http", "proxy.test", 8080),
+    )
+    recorded: dict[str, object] = {}
+
+    class _RoutedCodexClient:
+        async def open_ws_with_route_metadata(self, _url: str, **kwargs: object) -> SimpleNamespace:
+            recorded.update(kwargs)
+            return SimpleNamespace(
+                websocket=websocket,
+                context=websocket,
+                route=route,
+                fallback_used=False,
+            )
+
+    async def fake_stream_codex_websocket_events(*args: object, **kwargs: object):
+        del args, kwargs
+        yield 'data: {"type":"response.completed","response":{"id":"resp_heartbeat"}}\n\n'
+
+    monkeypatch.setattr(
+        proxy_module,
+        "get_settings",
+        lambda: SimpleNamespace(proxy_upstream_websocket_heartbeat_seconds=configured_heartbeat),
+    )
+    monkeypatch.setattr(proxy_module, "_stream_codex_websocket_events", fake_stream_codex_websocket_events)
+
+    events = [
+        event
+        async for event in proxy_module._stream_responses_via_websocket(
+            payload_dict={"model": "gpt-5.6-sol", "type": "response.create"},
+            url="https://chatgpt.com/backend-api/codex/responses",
+            headers={"originator": "codex_cli_rs"},
+            client_session=cast(proxy_module.aiohttp.ClientSession, SimpleNamespace()),
+            effective_total_timeout=5.0,
+            effective_connect_timeout=8.0,
+            effective_idle_timeout=45.0,
+            max_event_bytes=1024,
+            raise_for_status=True,
+            route=route,
+            codex_client=cast(Any, _RoutedCodexClient()),
+        )
+    ]
+
+    assert len(events) == 1
+    assert recorded["heartbeat"] == expected_heartbeat
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_via_websocket_preserves_raw_error_when_sdk_contract_disabled(monkeypatch):
     raw_payload: dict[str, object] = {
         "type": "error",
@@ -8066,6 +8126,53 @@ async def test_stream_responses_websocket_broken_pipe_is_not_replayable_upstream
     assert completion["failure_detail"] == "transport_error"
     assert completion["failure_exception_type"] == "BrokenPipeError"
     assert completion["retryable_same_contract"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_heartbeat", "expected_heartbeat"),
+    [(20.0, 20.0), (0.0, None)],
+)
+async def test_open_upstream_websocket_configures_public_aiohttp_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_heartbeat: float,
+    expected_heartbeat: float | None,
+) -> None:
+    websocket = SimpleNamespace(tag="public-ws")
+
+    class _WebSocketContext:
+        async def __aenter__(self):
+            return websocket
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _PublicWebSocketSession:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] = {}
+
+        def ws_connect(self, _url: str, **kwargs: object) -> _WebSocketContext:
+            self.kwargs = kwargs
+            return _WebSocketContext()
+
+    session = _PublicWebSocketSession()
+    monkeypatch.setattr(
+        proxy_module,
+        "get_settings",
+        lambda: SimpleNamespace(proxy_upstream_websocket_heartbeat_seconds=configured_heartbeat),
+    )
+
+    context, opened = await proxy_module._open_upstream_websocket(
+        session=cast(proxy_module.aiohttp.ClientSession, session),
+        url="wss://chatgpt.com/backend-api/codex/responses",
+        headers={"Authorization": "Bearer token"},
+        connect_timeout_seconds=8.0,
+        max_msg_size=1024,
+    )
+
+    assert opened is websocket
+    assert session.kwargs["heartbeat"] == expected_heartbeat
+    await context.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio
@@ -8250,7 +8357,15 @@ async def test_open_upstream_websocket_scopes_dns_failure_for_account_breaker(
 
 
 @pytest.mark.asyncio
-async def test_open_upstream_websocket_records_circuit_breaker_success_after_valid_handshake(monkeypatch):
+@pytest.mark.parametrize(
+    ("configured_heartbeat", "expected_heartbeat"),
+    [(20.0, 20.0), (0.0, None)],
+)
+async def test_open_upstream_websocket_records_circuit_breaker_success_after_valid_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_heartbeat: float,
+    expected_heartbeat: float | None,
+) -> None:
     class _CircuitBreakerStub:
         def __init__(self) -> None:
             self.state = CircuitState.CLOSED
@@ -8298,9 +8413,11 @@ async def test_open_upstream_websocket_records_circuit_breaker_success_after_val
     class _HandshakeSuccessSession:
         def __init__(self) -> None:
             self._loop = asyncio.get_running_loop()
+            self.constructed_heartbeats: list[float | None] = []
 
             def _build_ws(*args, **kwargs):
-                del args, kwargs
+                del args
+                self.constructed_heartbeats.append(kwargs["heartbeat"])
                 return SimpleNamespace(tag="ws")
 
             self._ws_response_class = _build_ws
@@ -8337,14 +8454,22 @@ async def test_open_upstream_websocket_records_circuit_breaker_success_after_val
         )
         return object()
 
-    monkeypatch.setattr(proxy_module, "get_settings", lambda: SimpleNamespace(circuit_breaker_enabled=True))
+    monkeypatch.setattr(
+        proxy_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            circuit_breaker_enabled=True,
+            proxy_upstream_websocket_heartbeat_seconds=configured_heartbeat,
+        ),
+    )
     monkeypatch.setattr(proxy_module, "get_circuit_breaker_for_account", lambda _aid, _settings: cb)
     monkeypatch.setattr(proxy_module.aiohttp.client_ws, "WebSocketDataQueue", lambda *args, **kwargs: object())
     monkeypatch.setattr(proxy_module, "WebSocketReader", _build_reader)
     monkeypatch.setattr(proxy_module, "WebSocketWriter", lambda *args, **kwargs: object())
 
+    session = _HandshakeSuccessSession()
     websocket_cm, websocket = await proxy_module._open_upstream_websocket(
-        session=cast(proxy_module.aiohttp.ClientSession, _HandshakeSuccessSession()),
+        session=cast(proxy_module.aiohttp.ClientSession, session),
         url="wss://chatgpt.com/backend-api/codex/responses",
         headers={"Authorization": "Bearer token"},
         connect_timeout_seconds=8.0,
@@ -8360,6 +8485,7 @@ async def test_open_upstream_websocket_records_circuit_breaker_success_after_val
     }
     assert cb.failures == []
     assert cb.successes == 0
+    assert session.constructed_heartbeats == [expected_heartbeat]
 
 
 @pytest.mark.asyncio
@@ -35842,6 +35968,47 @@ async def test_retry_http_bridge_precreated_request_suppresses_retry_after_respo
     reconnect.assert_not_awaited()
     upstream.send_text.assert_not_awaited()
     assert session.pending_requests == deque([request_state])
+
+
+@pytest.mark.asyncio
+async def test_retry_http_bridge_precreated_request_refuses_second_ambiguous_replay(monkeypatch):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-bridge-already-replayed",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"retry"}',
+        replay_count=1,
+    )
+    upstream = AsyncMock()
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "bridge-replay-bound", None),
+        headers={},
+        affinity=proxy_service._AffinityPolicy(),
+        request_model="gpt-5.6-sol",
+        account=_make_account("acc-bridge-replay-bound"),
+        upstream=upstream,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=0.0,
+        idle_ttl_seconds=30.0,
+        last_upstream_close_code=1011,
+    )
+    reconnect = AsyncMock(return_value=None)
+    monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
+
+    assert await service._retry_http_bridge_precreated_request(session) is False
+
+    reconnect.assert_not_awaited()
+    upstream.send_text.assert_not_awaited()
+    assert request_state.replay_count == 1
 
 
 @pytest.mark.asyncio

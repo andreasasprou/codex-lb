@@ -99,6 +99,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _codex_keepalive_frame,
     _fingerprint_input_items,
     _header_value_case_insensitive,
+    _http_bridge_response_created_timeout_seconds,
     _http_bridge_startup_keepalive_grace_seconds,
     _inject_missing_interrupted_function_call_outputs,
     _input_prefix_matches_stored_context,
@@ -2372,9 +2373,22 @@ class _HTTPBridgeStreamingMixin:
             keepalive_sent = False
             keepalive_count = 0
             while True:
-                keepalive_interval = getattr(_service_get_settings(), "sse_keepalive_interval_seconds", 10.0)
+                settings = _service_get_settings()
+                keepalive_interval = getattr(settings, "sse_keepalive_interval_seconds", 10.0)
+                response_create_sent_at = request_state.response_create_sent_at
+                response_create_timeout_seconds = _http_bridge_response_created_timeout_seconds(settings)
+                response_create_wait_seconds: float | None = None
+                if (
+                    request_state.awaiting_response_created
+                    and response_create_sent_at is not None
+                    and not request_state.account_capacity_waiting
+                ):
+                    response_create_wait_seconds = max(
+                        0.001,
+                        response_create_timeout_seconds - (_service_time().monotonic() - response_create_sent_at),
+                    )
+                wait_timeout: float | None = None
                 if keepalive_interval > 0:
-                    settings = _service_get_settings()
                     stream_keepalive_max_count = _stream_keepalive_max_count()
                     stream_idle_timeout_seconds = getattr(
                         settings,
@@ -2388,9 +2402,42 @@ class _HTTPBridgeStreamingMixin:
                     wait_timeout = keepalive_interval
                     if not yielded_any and not keepalive_sent:
                         wait_timeout = max(wait_timeout, _http_bridge_startup_keepalive_grace_seconds())
+                if response_create_wait_seconds is not None:
+                    wait_timeout = (
+                        response_create_wait_seconds
+                        if wait_timeout is None
+                        else min(wait_timeout, response_create_wait_seconds)
+                    )
+                if wait_timeout is not None:
                     try:
                         event_block = await asyncio.wait_for(event_queue.get(), timeout=wait_timeout)
                     except asyncio.TimeoutError:
+                        current_response_create_sent_at = request_state.response_create_sent_at
+                        if (
+                            request_state.awaiting_response_created
+                            and current_response_create_sent_at is not None
+                            and not request_state.account_capacity_waiting
+                            and _service_time().monotonic() - current_response_create_sent_at
+                            >= response_create_timeout_seconds
+                        ):
+                            logger.warning(
+                                "HTTP bridge response.created progress timeout request_id=%s timeout_seconds=%.1f",
+                                request_state.request_id,
+                                response_create_timeout_seconds,
+                            )
+                            yield format_sse_event(
+                                cast(
+                                    Mapping[str, JsonValue],
+                                    response_failed_event(
+                                        "stream_incomplete",
+                                        "Upstream did not acknowledge response.create in time",
+                                        response_id=_websocket_downstream_response_id(request_state),
+                                    ),
+                                )
+                            )
+                            break
+                        if keepalive_interval <= 0:
+                            continue
                         if request_state.account_capacity_waiting:
                             keepalive_count = 0
                             keepalive_sent = True

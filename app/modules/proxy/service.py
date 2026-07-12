@@ -233,6 +233,9 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_requires_cluster_registration as _http_bridge_requires_cluster_registration,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _http_bridge_response_created_timeout_seconds as _http_bridge_response_created_timeout_seconds,
+)
+from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_runtime_config as _http_bridge_runtime_config,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
@@ -1299,7 +1302,7 @@ class ProxyService(
                     queued_count = bridge_session.queued_request_count
                 pending_request_ids = [state.request_log_id or state.request_id for state in pending_states]
                 pending_request_ages_seconds = [max(0.0, now - state.started_at) for state in pending_states]
-                threshold_seconds = float(
+                configured_threshold_seconds = float(
                     getattr(
                         get_settings(),
                         "http_responses_session_bridge_stuck_gate_retire_after_seconds",
@@ -1308,6 +1311,12 @@ class ProxyService(
                 )
                 # Leading telemetry records latency without assigning a response
                 # or releasing this gate; only response-created proves progress.
+                progress_timeout_seconds = _http_bridge_response_created_timeout_seconds()
+                threshold_seconds = min(
+                    configured_threshold_seconds,
+                    progress_timeout_seconds,
+                    timeout_seconds,
+                )
                 should_retire_stuck_session = any(
                     state.transport == _REQUEST_TRANSPORT_HTTP
                     and not state.skip_request_log
@@ -1316,7 +1325,9 @@ class ProxyService(
                     and not state.downstream_visible
                     and state.latency_response_created_ms is None
                     and state.response_event_count == 0
-                    and max(0.0, now - state.started_at) >= threshold_seconds
+                    and not state.account_capacity_waiting
+                    and state.response_create_sent_at is not None
+                    and max(0.0, now - state.response_create_sent_at) >= threshold_seconds
                     for state in pending_states
                 )
             _log_http_bridge_startup_wait_timeout(

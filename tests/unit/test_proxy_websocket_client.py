@@ -226,6 +226,7 @@ async def test_connect_responses_websocket_uses_websockets_transport(monkeypatch
             upstream_connect_timeout_seconds=7.0,
             max_sse_event_bytes=4321,
             upstream_websocket_trust_env=False,
+            proxy_upstream_websocket_heartbeat_seconds=13.0,
         ),
     )
 
@@ -251,8 +252,8 @@ async def test_connect_responses_websocket_uses_websockets_transport(monkeypatch
     assert kwargs["user_agent_header"] == "Codex CLI Test"
     assert kwargs["proxy"] is None
     assert kwargs["open_timeout"] == 7.0
-    assert "ping_interval" not in kwargs
-    assert kwargs["ping_timeout"] is None
+    assert kwargs["ping_interval"] == 13.0
+    assert kwargs["ping_timeout"] == 13.0
     assert kwargs["max_size"] == 4321
     additional_headers = cast(dict[str, str], kwargs["additional_headers"])
     assert additional_headers["Authorization"] == "Bearer access-token"
@@ -325,6 +326,7 @@ async def test_connect_responses_websocket_routed_codex_call_preserves_size_limi
             upstream_connect_timeout_seconds=7.0,
             max_sse_event_bytes=4321,
             upstream_websocket_trust_env=False,
+            proxy_upstream_websocket_heartbeat_seconds=13.0,
         ),
     )
 
@@ -346,6 +348,7 @@ async def test_connect_responses_websocket_routed_codex_call_preserves_size_limi
     assert call["url"] == "wss://chatgpt.com/backend-api/codex/responses"
     assert call["route"] is route
     assert call["timeout"] == 7.0
+    assert call["heartbeat"] == 13.0
     assert call["max_msg_size"] == 4321
     assert "max_size" not in call
     assert websocket.response_header("x-codex-turn-state") == "turn-routed"

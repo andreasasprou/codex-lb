@@ -8798,6 +8798,7 @@ async def test_http_bridge_stale_gate_retires_after_leading_rate_limit_telemetry
         transport="http",
         response_create_gate=gate,
         response_create_gate_acquired=True,
+        response_create_sent_at=time.monotonic() - 1.0,
         awaiting_response_created=True,
         event_queue=asyncio.Queue(),
     )
@@ -8936,6 +8937,7 @@ async def test_codex_responses_http_bridge_replaces_retired_gate_without_client_
         transport="http",
         response_create_gate=gate,
         response_create_gate_acquired=True,
+        response_create_sent_at=time.monotonic() - 1.0,
         awaiting_response_created=True,
         event_queue=asyncio.Queue(),
         request_text='{"type":"response.create","model":"gpt-5.6-sol"}',

@@ -1610,6 +1610,12 @@ def _should_fallback_to_http_after_websocket_status(transport_mode: str, status:
     return transport_mode == "auto" and status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES
 
 
+def _upstream_websocket_heartbeat_seconds(settings: Any | None = None) -> float | None:
+    settings = settings or get_settings()
+    raw_heartbeat_seconds = float(getattr(settings, "proxy_upstream_websocket_heartbeat_seconds", 20.0))
+    return raw_heartbeat_seconds if raw_heartbeat_seconds > 0 else None
+
+
 async def _open_upstream_websocket(
     *,
     session: aiohttp.ClientSession,
@@ -1621,6 +1627,7 @@ async def _open_upstream_websocket(
     hold_half_open_probe: bool = False,
 ) -> tuple[AsyncContextManager[aiohttp.ClientWebSocketResponse], aiohttp.ClientWebSocketResponse]:
     settings = get_settings()
+    heartbeat_seconds = _upstream_websocket_heartbeat_seconds(settings)
     circuit_breaker = get_circuit_breaker_for_account(account_id, settings) if account_id else None
     is_probe = False
     if circuit_breaker is not None:
@@ -1636,6 +1643,7 @@ async def _open_upstream_websocket(
                 receive_timeout=None,
                 autoping=True,
                 autoclose=True,
+                heartbeat=heartbeat_seconds,
                 max_msg_size=max_msg_size,
             )
             websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
@@ -1741,7 +1749,7 @@ async def _open_upstream_websocket(
             True,
             True,
             session._loop,
-            heartbeat=None,
+            heartbeat=heartbeat_seconds,
             compress=0,
             client_notakeover=False,
         )
@@ -1917,6 +1925,7 @@ async def _stream_responses_via_websocket(
     lifecycle_recorded = False
     seen_terminal = False
     settings = get_settings()
+    heartbeat_seconds = _upstream_websocket_heartbeat_seconds(settings)
     if account_id is not None:
         circuit_breaker = get_circuit_breaker_for_account(account_id, settings)
 
@@ -1953,6 +1962,7 @@ async def _stream_responses_via_websocket(
                     route=route,
                     headers=headers,
                     timeout=connect_timeout_seconds,
+                    heartbeat=heartbeat_seconds,
                     max_msg_size=max_event_bytes,
                 )
                 websocket = result.websocket
@@ -1965,6 +1975,7 @@ async def _stream_responses_via_websocket(
                     route=route,
                     headers=headers,
                     timeout=connect_timeout_seconds,
+                    heartbeat=heartbeat_seconds,
                     max_msg_size=max_event_bytes,
                 )
                 websocket = (

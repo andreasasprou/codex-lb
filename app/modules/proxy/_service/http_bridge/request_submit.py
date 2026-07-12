@@ -1411,6 +1411,8 @@ class _HTTPBridgeRequestSubmitMixin:
             if len(retryable_requests) != 1:
                 return False
             request_state = retryable_requests[0]
+            if request_state.replay_count >= 1:
+                return False
             if request_state.previous_response_id is not None and not (
                 request_state.proxy_injected_previous_response_id
                 and request_state.fresh_upstream_request_is_retry_safe
