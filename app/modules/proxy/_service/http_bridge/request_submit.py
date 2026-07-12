@@ -198,6 +198,7 @@ async def _send_http_bridge_request_text_with_archive_id(
 ) -> None:
     token = set_request_id(request_state.archive_request_id)
     try:
+        request_state.response_create_submitted_at = _service_time().monotonic()
         await session.upstream.send_text(text_data)
     finally:
         reset_request_id(token)
@@ -1210,6 +1211,8 @@ class _HTTPBridgeRequestSubmitMixin:
             if len(retryable_requests) != 1:
                 return False
             request_state = retryable_requests[0]
+            if request_state.replay_count >= 1:
+                return False
             if request_state.previous_response_id is not None and not (
                 request_state.proxy_injected_previous_response_id
                 and request_state.fresh_upstream_request_is_retry_safe

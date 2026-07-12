@@ -183,6 +183,7 @@ T = TypeVar("T")
 _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR = "_codex_lb_started_at"
 _HTTP_BRIDGE_STALE_INFLIGHT_MIN_SECONDS = 120.0
 _HTTP_BRIDGE_STALE_INFLIGHT_TIMEOUT_MULTIPLIER = 6.0
+_HTTP_BRIDGE_RESPONSE_CREATED_TIMEOUT_RATIO = 0.75
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +229,25 @@ def _service_time() -> Any:
 
 def _proxy_admission_wait_timeout_seconds(settings: Any | None = None) -> float:
     return cast(Callable[[Any | None], float], _service_global("_proxy_admission_wait_timeout_seconds"))(settings)
+
+
+def _http_bridge_response_created_timeout_seconds(settings: Any | None = None) -> float:
+    settings = settings or _service_get_settings()
+    admission_timeout = _proxy_admission_wait_timeout_seconds(settings)
+    automatic_timeout = max(0.001, admission_timeout * _HTTP_BRIDGE_RESPONSE_CREATED_TIMEOUT_RATIO)
+    try:
+        configured_timeout = float(
+            getattr(
+                settings,
+                "http_responses_session_bridge_response_created_timeout_seconds",
+                0.0,
+            )
+        )
+    except (TypeError, ValueError):
+        configured_timeout = 0.0
+    if configured_timeout <= 0:
+        return automatic_timeout
+    return max(0.001, min(configured_timeout, automatic_timeout))
 
 
 def _http_bridge_stale_inflight_seconds() -> float:

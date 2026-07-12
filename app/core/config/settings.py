@@ -215,6 +215,8 @@ class Settings(BaseSettings):
         default_factory=list
     )
     http_responses_session_bridge_stuck_gate_retire_after_seconds: float = Field(default=300.0, gt=0)
+    # 0 derives 75% of response-create admission so holder cleanup wins first.
+    http_responses_session_bridge_response_created_timeout_seconds: float = Field(default=0.0, ge=0)
     http_responses_session_bridge_max_sessions: int = Field(default=256, gt=0)
     http_responses_session_bridge_queue_limit: int = Field(default=8, gt=0)
     http_responses_session_bridge_gateway_safe_mode: bool = False
@@ -318,6 +320,8 @@ class Settings(BaseSettings):
     dashboard_bootstrap_token: str | None = None
     proxy_token_refresh_limit: int = Field(default=64, ge=0)
     proxy_upstream_websocket_connect_limit: int = Field(default=128, ge=0)
+    # 0 retains legacy disabled aiohttp heartbeat behavior.
+    proxy_upstream_websocket_heartbeat_seconds: float = Field(default=20.0, ge=0)
     proxy_response_create_limit: int = Field(default=256, ge=0)
     proxy_compact_response_create_limit: int = Field(default=64, ge=0)
     proxy_admission_wait_timeout_seconds: float = Field(default=10.0, gt=0)

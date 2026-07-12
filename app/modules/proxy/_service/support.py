@@ -371,6 +371,7 @@ class _WebSocketRequestState:
     latency_response_create_gate_wait_ms: int | None = None
     latency_bridge_queue_wait_ms: int | None = None
     response_create_gate_wait_started_at: float | None = None
+    response_create_submitted_at: float | None = None
     bridge_queue_wait_started_at: float | None = None
     prewarm_status: str | None = None
     prewarm_latency_ms: int | None = None

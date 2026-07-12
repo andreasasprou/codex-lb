@@ -191,6 +191,13 @@ def _proxy_admission_wait_timeout_seconds(settings: Any | None = None) -> float:
     return cast(Callable[[Any | None], float], _service_global("_proxy_admission_wait_timeout_seconds"))(settings)
 
 
+def _http_bridge_response_created_timeout_seconds(settings: Any | None = None) -> float:
+    return cast(
+        Callable[[Any | None], float],
+        _service_global("_http_bridge_response_created_timeout_seconds"),
+    )(settings)
+
+
 def _maybe_log_proxy_request_payload(kind: str, payload: ResponsesRequest, headers: Mapping[str, str]) -> None:
     cast(Callable[..., None], _service_global("_maybe_log_proxy_request_payload"))(kind, payload, headers)
 
