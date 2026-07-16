@@ -1023,6 +1023,29 @@ def _http_bridge_payload_looks_like_full_resend(payload: ResponsesRequest) -> bo
     return False
 
 
+_SUSPECT_DURABLE_ANCHOR_TTL_SECONDS = 900.0
+_SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES = 512
+
+
+def _prune_suspect_durable_anchors(suspect_anchors: dict[str, float], now: float) -> None:
+    expired = [response_id for response_id, deadline in suspect_anchors.items() if deadline <= now]
+    for response_id in expired:
+        del suspect_anchors[response_id]
+    while len(suspect_anchors) > _SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES:
+        oldest = min(suspect_anchors, key=suspect_anchors.__getitem__)
+        del suspect_anchors[oldest]
+
+
+def _mark_suspect_durable_anchor(suspect_anchors: dict[str, float], response_id: str, now: float) -> None:
+    suspect_anchors[response_id] = now + _SUSPECT_DURABLE_ANCHOR_TTL_SECONDS
+    _prune_suspect_durable_anchors(suspect_anchors, now)
+
+
+def _is_suspect_durable_anchor(suspect_anchors: dict[str, float], response_id: str, now: float) -> bool:
+    _prune_suspect_durable_anchors(suspect_anchors, now)
+    return response_id in suspect_anchors
+
+
 def _preferred_http_bridge_reconnect_turn_state(session: "_HTTPBridgeSession") -> str | None:
     if (
         session.codex_session

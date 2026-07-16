@@ -37532,3 +37532,38 @@ async def test_inline_http_bridge_image_urls_rejects_when_fetch_fails(monkeypatc
 
     assert exc_info.value.status_code == 400
     assert "image_download_failed" in json.dumps(exc_info.value.payload)
+
+
+def test_suspect_durable_anchor_marking_and_expiry() -> None:
+    from app.modules.proxy._service.http_bridge.helpers import (
+        _SUSPECT_DURABLE_ANCHOR_TTL_SECONDS,
+        _is_suspect_durable_anchor,
+        _mark_suspect_durable_anchor,
+    )
+
+    suspect_anchors: dict[str, float] = {}
+    _mark_suspect_durable_anchor(suspect_anchors, "resp_stale", 100.0)
+    assert _is_suspect_durable_anchor(suspect_anchors, "resp_stale", 100.0)
+    assert not _is_suspect_durable_anchor(suspect_anchors, "resp_other", 100.0)
+    assert _is_suspect_durable_anchor(suspect_anchors, "resp_stale", 100.0 + _SUSPECT_DURABLE_ANCHOR_TTL_SECONDS - 1.0)
+    assert not _is_suspect_durable_anchor(suspect_anchors, "resp_stale", 100.0 + _SUSPECT_DURABLE_ANCHOR_TTL_SECONDS)
+    assert suspect_anchors == {}
+
+
+def test_suspect_durable_anchor_bounded_size() -> None:
+    from app.modules.proxy._service.http_bridge.helpers import (
+        _SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES,
+        _is_suspect_durable_anchor,
+        _mark_suspect_durable_anchor,
+    )
+
+    suspect_anchors: dict[str, float] = {}
+    for index in range(_SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES + 10):
+        _mark_suspect_durable_anchor(suspect_anchors, f"resp_{index}", 100.0 + index)
+    assert len(suspect_anchors) == _SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES
+    assert not _is_suspect_durable_anchor(suspect_anchors, "resp_0", 200.0)
+    assert _is_suspect_durable_anchor(
+        suspect_anchors,
+        f"resp_{_SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES + 9}",
+        100.0 + _SUSPECT_DURABLE_ANCHOR_MAX_ENTRIES + 9,
+    )

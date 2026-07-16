@@ -19311,3 +19311,271 @@ async def test_cancel_api_key_reservation_heartbeat_task_does_not_wait_for_task_
     await asyncio.sleep(0)
 
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_response_created_progress_timeout_marks_injected_anchor_suspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="sid-suspect-anchor")
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-suspect-anchor",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+        event_queue=asyncio.Queue(),
+    )
+    request_state.proxy_injected_previous_response_id = True
+    request_state.previous_response_id = "resp_stale_anchor"
+    service._http_bridge_sessions[session.key] = session
+    settings = _make_app_settings(
+        sse_keepalive_interval_seconds=0.0,
+        proxy_admission_wait_timeout_seconds=0.5,
+        http_responses_session_bridge_response_created_timeout_seconds=0.02,
+    )
+
+    async def submit_without_acknowledgement(
+        target_session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+    ) -> None:
+        del text_data, queue_limit
+        await target_session.response_create_gate.acquire()
+        request_state.response_create_gate = target_session.response_create_gate
+        request_state.response_create_gate_acquired = True
+        request_state.awaiting_response_created = True
+        request_state.response_create_sent_at = time.monotonic()
+        target_session.pending_requests.append(request_state)
+        target_session.queued_request_count += 1
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_HTTP_BRIDGE_STARTUP_KEEPALIVE_GRACE_SECONDS", 0.001)
+    monkeypatch.setattr(service, "_submit_http_bridge_request", submit_without_acknowledgement)
+
+    with anyio.fail_after(settings.proxy_admission_wait_timeout_seconds):
+        chunks = [
+            chunk
+            async for chunk in service._stream_http_bridge_session_events(
+                session,
+                request_state=request_state,
+                text_data='{"type":"response.create"}',
+                queue_limit=4,
+                propagate_http_errors=True,
+                downstream_turn_state=None,
+            )
+        ]
+
+    assert len(chunks) == 1
+    payload = proxy_service.parse_sse_data_json(chunks[0])
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+    assert "resp_stale_anchor" in service._http_bridge_suspect_durable_anchors
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_response_created_progress_timeout_ignores_client_provided_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="sid-client-anchor")
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-client-anchor",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+        event_queue=asyncio.Queue(),
+    )
+    request_state.previous_response_id = "resp_client_anchor"
+    service._http_bridge_sessions[session.key] = session
+    settings = _make_app_settings(
+        sse_keepalive_interval_seconds=0.0,
+        proxy_admission_wait_timeout_seconds=0.5,
+        http_responses_session_bridge_response_created_timeout_seconds=0.02,
+    )
+
+    async def submit_without_acknowledgement(
+        target_session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        text_data: str,
+        queue_limit: int,
+    ) -> None:
+        del text_data, queue_limit
+        await target_session.response_create_gate.acquire()
+        request_state.response_create_gate = target_session.response_create_gate
+        request_state.response_create_gate_acquired = True
+        request_state.awaiting_response_created = True
+        request_state.response_create_sent_at = time.monotonic()
+        target_session.pending_requests.append(request_state)
+        target_session.queued_request_count += 1
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "_HTTP_BRIDGE_STARTUP_KEEPALIVE_GRACE_SECONDS", 0.001)
+    monkeypatch.setattr(service, "_submit_http_bridge_request", submit_without_acknowledgement)
+
+    with anyio.fail_after(settings.proxy_admission_wait_timeout_seconds):
+        chunks = [
+            chunk
+            async for chunk in service._stream_http_bridge_session_events(
+                session,
+                request_state=request_state,
+                text_data='{"type":"response.create"}',
+                queue_limit=4,
+                propagate_http_errors=True,
+                downstream_turn_state=None,
+            )
+        ]
+
+    assert len(chunks) == 1
+    assert service._http_bridge_suspect_durable_anchors == {}
+
+
+def _suspect_anchor_stream_kwargs() -> dict[str, Any]:
+    return dict(
+        codex_session_affinity=True,
+        propagate_http_errors=False,
+        openai_cache_affinity=True,
+        api_key=None,
+        api_key_reservation=None,
+        suppress_text_done_events=False,
+        idle_ttl_seconds=120.0,
+        codex_idle_ttl_seconds=1800.0,
+        max_sessions=8,
+        queue_limit=4,
+    )
+
+
+def _suspect_anchor_durable_lookup() -> proxy_service.DurableBridgeLookup:
+    return proxy_service.DurableBridgeLookup(
+        session_id="durable-suspect-anchor",
+        canonical_kind="session_header",
+        canonical_key="sess-suspect-anchor",
+        api_key_scope="__anonymous__",
+        account_id="acc-1",
+        owner_instance_id=None,
+        owner_epoch=1,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.ACTIVE,
+        latest_turn_state=None,
+        latest_response_id="resp_stale_anchor",
+        latest_input_item_count=2,
+        latest_input_full_fingerprint="fp-full",
+    )
+
+
+async def _run_suspect_anchor_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    service: Any,
+) -> list[proxy_service.ResponsesRequest]:
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "one"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "two"}]},
+            ],
+        }
+    )
+    headers = {"session_id": "sess-suspect-anchor"}
+    prepared_payloads: list[proxy_service.ResponsesRequest] = []
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-suspect-anchor-stream",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+    event_queue = request_state.event_queue
+    assert event_queue is not None
+    await event_queue.put(None)
+
+    def fake_prepare(
+        prepared_payload: proxy_service.ResponsesRequest,
+        _headers: dict[str, str] | Any,
+        *,
+        api_key: proxy_service.ApiKeyData | None,
+        api_key_reservation: proxy_service.ApiKeyUsageReservationData | None,
+        request_id: str,
+        client_ip: str | None = None,
+    ) -> tuple[proxy_service._WebSocketRequestState, str]:
+        del api_key, api_key_reservation, request_id, client_ip
+        prepared_payloads.append(prepared_payload)
+        return request_state, '{"type":"response.create"}'
+
+    session = _make_bridge_session(key_value="sess-suspect-anchor")
+
+    async def fake_get_or_create_http_bridge_session(*args: object, **kwargs: object):
+        del args, kwargs
+        return session
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: cast(
+            Any,
+            SimpleNamespace(
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        sticky_threads_enabled=False,
+                        openai_cache_affinity_max_age_seconds=1800,
+                        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+                        http_responses_session_bridge_gateway_safe_mode=False,
+                    )
+                )
+            ),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(proxy_service, "_input_prefix_matches_stored_context", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "lookup_request_targets",
+        AsyncMock(return_value=_suspect_anchor_durable_lookup()),
+    )
+    monkeypatch.setattr(service, "_http_bridge_can_forward_to_active_owner", AsyncMock(return_value=False))
+    monkeypatch.setattr(service, "_prepare_http_bridge_request", fake_prepare)
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", fake_get_or_create_http_bridge_session)
+    monkeypatch.setattr(service, "_submit_http_bridge_request", AsyncMock())
+    monkeypatch.setattr(service, "_detach_http_bridge_request", AsyncMock())
+
+    async for _chunk in service._stream_via_http_bridge(
+        payload,
+        headers=headers,
+        **_suspect_anchor_stream_kwargs(),
+    ):
+        pass
+    return prepared_payloads
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_injects_durable_anchor_when_not_suspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service)
+    assert prepared_payloads
+    assert prepared_payloads[-1].previous_response_id == "resp_stale_anchor"
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_skips_suspect_durable_anchor_on_full_resend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    service._http_bridge_suspect_durable_anchors["resp_stale_anchor"] = time.monotonic() + 900.0
+    prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service)
+    assert prepared_payloads
+    assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
