@@ -943,21 +943,24 @@ class _HTTPBridgeStreamingMixin:
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
             )
-            # A durable anchor from a dead upstream connection can stall the fresh
-            # bridge pre-`response.created`; because the durable record keeps that
-            # anchor, every full-resend retry would stall the same way. Anchors that
-            # already caused a progress timeout are skipped while suspect, but only
-            # for full resends — they carry their own continuity. A short follow-up
-            # without the anchor would lose its conversation, so it keeps the anchor
-            # and relies on the progress deadline.
-            if (
-                anchor_injection_eligible
-                and _http_bridge_payload_looks_like_full_resend(payload)
-                and durable_lookup.latest_response_id is not None
-                and _is_suspect_durable_anchor(
-                    self._http_bridge_suspect_durable_anchors,
-                    durable_lookup.latest_response_id,
-                    _service_time().monotonic(),
+            # A durable anchor from a dead upstream connection stalls the fresh
+            # bridge pre-`response.created` — measured in production on
+            # 2026-07-16, fresh-bridge anchored reattach failed for effectively
+            # every injection (91/91 within 2.5h) while same-connection anchor
+            # injection kept working. A full resend carries its own continuity,
+            # so it never takes the anchor on a fresh bridge. A short follow-up
+            # without the anchor would lose its conversation, so it keeps the
+            # anchor unless that anchor already proved stale, and otherwise
+            # relies on the progress deadline.
+            if anchor_injection_eligible and (
+                _http_bridge_payload_looks_like_full_resend(payload)
+                or (
+                    durable_lookup.latest_response_id is not None
+                    and _is_suspect_durable_anchor(
+                        self._http_bridge_suspect_durable_anchors,
+                        durable_lookup.latest_response_id,
+                        _service_time().monotonic(),
+                    )
                 )
             ):
                 _log_http_bridge_event(
@@ -1296,7 +1299,21 @@ class _HTTPBridgeStreamingMixin:
                     exclude_account_ids=fresh_replay_excluded_account_ids or None,
                 )
             except ProxyResponseError as exc:
-                if not owner_unavailable_allows_account_neutral_replay(exc):
+                # A full resend can recover from an unavailable durable owner by
+                # rebuilding locally without the durable lookup: either the legacy
+                # injected-anchor state is present, or the payload is a full resend
+                # that never took an anchor. durable_lookup is nulled by the
+                # recovery body, so this branch runs at most once per request.
+                owner_unavailable_recoverable = _http_bridge_is_previous_response_owner_unavailable(exc) and (
+                    (
+                        proxy_injected_previous_response_id
+                        and fresh_upstream_request_text is not None
+                        and durable_full_resend_anchor_count is not None
+                        and durable_full_resend_anchor_fingerprint is not None
+                    )
+                    or (durable_lookup is not None and _http_bridge_payload_looks_like_full_resend(payload))
+                )
+                if not (owner_unavailable_allows_account_neutral_replay(exc) or owner_unavailable_recoverable):
                     wait_plan = _http_bridge_capacity_wait_plan(exc, request_deadline=request_deadline)
                     if wait_plan is not None:
                         bounded_wait_seconds, account_capacity_wait_seconds, message = wait_plan
@@ -1320,7 +1337,45 @@ class _HTTPBridgeStreamingMixin:
                             raise
                         continue
                     raise
-                switch_to_account_neutral_replay()
+                if owner_unavailable_allows_account_neutral_replay(exc):
+                    switch_to_account_neutral_replay()
+                    continue
+                _log_http_bridge_event(
+                    "owner_unavailable_fresh_resend",
+                    bridge_session_key,
+                    account_id=request_state.preferred_account_id,
+                    model=payload.model,
+                    detail="outcome=fresh_full_resend_without_anchor",
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                )
+                request_state, text_data = prepare_bridge_request(payload)
+                request_state.affinity_policy = affinity
+                if downstream_turn_state is not None:
+                    request_state.session_id = _normalize_session_id(downstream_turn_state)
+                request_state.transport = _REQUEST_TRANSPORT_HTTP
+                request_state.request_stage = _http_bridge_request_stage(
+                    headers=headers,
+                    payload=payload,
+                    durable_lookup=None,
+                )
+                file_required_preferred_account = False
+                if rewritten_file_account_id is not None:
+                    request_state.preferred_account_id = rewritten_file_account_id
+                    file_required_preferred_account = True
+                if request_state.preferred_account_id is None:
+                    resolved_file_account_id = await self._resolve_file_account_for_responses(payload, headers)
+                    if resolved_file_account_id is not None:
+                        request_state.preferred_account_id = resolved_file_account_id
+                        file_required_preferred_account = True
+                effective_payload = payload
+                untrimmed_effective_payload = payload
+                proxy_injected_previous_response_id = False
+                previous_response_trimmed_input_count = None
+                previous_response_trimmed_input_fingerprint = None
+                durable_full_resend_anchor_count = None
+                durable_full_resend_anchor_fingerprint = None
+                durable_lookup = None
                 continue
             break
         if isinstance(session_or_forward, _HTTPBridgeOwnerForward):

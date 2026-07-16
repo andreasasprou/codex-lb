@@ -6596,7 +6596,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
 
 
 @pytest.mark.asyncio
-async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_resend(
+async def test_stream_via_http_bridge_full_resend_stays_unanchored_even_when_trimmable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -6755,13 +6755,11 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
     ]
 
     assert chunks == []
-    assert prepared_previous_response_ids == [None, "resp_latest", "resp_latest"]
-    assert prepared_input_lengths == [3, 3, 1]
+    assert prepared_previous_response_ids == [None]
+    assert prepared_input_lengths == [3]
     assert all("tools" not in frame for frame in prepared_frames)
-    assert prepared_frames[-1]["input"] == [input_items[-1]]
+    assert prepared_frames[-1].get("previous_response_id") is None
     assert [frame["client_metadata"][CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY] for frame in prepared_frames] == [
-        "true",
-        "true",
         "true",
     ]
     assert all(
@@ -7955,7 +7953,7 @@ async def test_stream_via_http_bridge_proves_fallback_owner_key_before_legacy_fo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("forward_to_active_owner", [False, True], ids=["local_create", "owner_forward"])
-async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavailable_fresh_resend(
+async def test_stream_via_http_bridge_recovers_unanchored_full_resend_after_owner_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     forward_to_active_owner: bool,
 ) -> None:
@@ -8128,7 +8126,7 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
         assert prepared_previous_response_ids == [None, None, None]
         assert forwarded_payloads == [payload]
     else:
-        assert prepared_previous_response_ids[-2:] == ["resp_latest", None]
+        assert prepared_previous_response_ids[-2:] == [None, None]
         assert forwarded_payloads == []
     assert get_or_create_kwargs[-1]["allow_forward_to_owner"] is False
     assert get_or_create_kwargs[-1]["exclude_account_ids"] == {"acc-1"}
@@ -16948,24 +16946,35 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         enforce_openai_sdk_contract=False,
     )
     if unsafe_replay_input is not None:
-        with pytest.raises(ProxyResponseError) as exc_info:
-            async for _ in stream:
-                pass
-
         if unsafe_replay_input == "missing_owner":
+            with pytest.raises(ProxyResponseError) as exc_info:
+                async for _ in stream:
+                    pass
             assert exc_info.value.status_code == 502
             assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+            assert get_or_create.await_count == 0
         else:
-            assert exc_info.value is owner_unavailable
-        assert get_or_create.await_count == (0 if unsafe_replay_input == "missing_owner" else 1)
-        if unsafe_replay_input == "conversation":
-            last_call = get_or_create.await_args
-            assert last_call is not None
-            assert last_call.kwargs["previous_response_id"] is None
-        if unsafe_replay_input in {"missing_owner", "missing_prior_output", "orphan_output"}:
-            account_neutral_classifier.assert_not_called()
-        else:
-            account_neutral_classifier.assert_called_once()
+            chunks = [chunk async for chunk in stream]
+            assert chunks == ['data: {"type":"response.completed"}\n\n']
+            assert get_or_create.await_count == 3
+            first_call = get_or_create.await_args_list[0]
+            second_call = get_or_create.await_args_list[1]
+            third_call = get_or_create.await_args_list[2]
+            assert first_call.kwargs["previous_response_id"] is None
+            assert first_call.kwargs["preferred_account_id"] == "acc-owner"
+            assert second_call.kwargs["previous_response_id"] is None
+            assert second_call.kwargs["preferred_account_id"] is None
+            assert second_call.kwargs["durable_lookup"] is None
+            assert third_call.kwargs["previous_response_id"] is None
+            assert third_call.kwargs["preferred_account_id"] is None
+            assert third_call.kwargs["durable_lookup"] is None
+            assert captured_request_states[0].previous_response_id is None
+            replay_payload = json.loads(captured_text_data[0])
+            assert "previous_response_id" not in replay_payload
+            if unsafe_replay_input in {"conversation", "file"}:
+                account_neutral_classifier.assert_called_once()
+            else:
+                account_neutral_classifier.assert_not_called()
         return
 
     chunks = [chunk async for chunk in stream]
@@ -16975,7 +16984,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     first_call = get_or_create.await_args_list[0]
     second_call = get_or_create.await_args_list[1]
     third_call = get_or_create.await_args_list[2]
-    assert first_call.kwargs["previous_response_id"] == ("resp_completed_anchor" if stored_model is None else None)
+    assert first_call.kwargs["previous_response_id"] is None
     assert first_call.kwargs["preferred_account_id"] == "acc-owner"
     assert first_call.kwargs["allow_forward_to_owner"] is True
     assert second_call.kwargs["previous_response_id"] is None
@@ -19475,15 +19484,19 @@ def _suspect_anchor_durable_lookup() -> proxy_service.DurableBridgeLookup:
 async def _run_suspect_anchor_stream(
     monkeypatch: pytest.MonkeyPatch,
     service: Any,
+    *,
+    full_resend: bool = True,
 ) -> list[proxy_service.ResponsesRequest]:
+    input_items: list[dict[str, Any]] = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "one"}]},
+    ]
+    if full_resend:
+        input_items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "two"}]})
     payload = proxy_service.ResponsesRequest.model_validate(
         {
             "model": "gpt-5.4",
             "instructions": "hi",
-            "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "one"}]},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "two"}]},
-            ],
+            "input": input_items,
         }
     )
     headers = {"session_id": "sess-suspect-anchor"}
@@ -19561,21 +19574,31 @@ async def _run_suspect_anchor_stream(
 
 
 @pytest.mark.asyncio
-async def test_stream_via_http_bridge_injects_durable_anchor_when_not_suspect(
+async def test_stream_via_http_bridge_never_injects_durable_anchor_on_full_resend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service)
     assert prepared_payloads
+    assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_injects_durable_anchor_for_short_follow_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service, full_resend=False)
+    assert prepared_payloads
     assert prepared_payloads[-1].previous_response_id == "resp_stale_anchor"
 
 
 @pytest.mark.asyncio
-async def test_stream_via_http_bridge_skips_suspect_durable_anchor_on_full_resend(
+async def test_stream_via_http_bridge_skips_suspect_durable_anchor_on_short_follow_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     service._http_bridge_suspect_durable_anchors["resp_stale_anchor"] = time.monotonic() + 900.0
-    prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service)
+    prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service, full_resend=False)
     assert prepared_payloads
     assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
