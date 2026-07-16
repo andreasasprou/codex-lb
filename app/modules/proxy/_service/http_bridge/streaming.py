@@ -79,9 +79,11 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_should_attempt_local_previous_response_recovery,
     _http_bridge_should_attempt_soft_affinity_reroute,
     _http_bridge_should_rollover_after_context_overflow,
+    _is_suspect_durable_anchor,
     _log_http_bridge_event,
     _make_http_bridge_session_header_fallback_key,
     _make_http_bridge_session_key,
+    _mark_suspect_durable_anchor,
     _record_bridge_reattach,
     _record_continuity_fail_closed,
     _release_http_bridge_unanchored_handoff,
@@ -791,14 +793,41 @@ class _HTTPBridgeStreamingMixin:
                 stored_count=durable_lookup.latest_input_item_count or 0,
                 stored_fingerprint=durable_lookup.latest_input_full_fingerprint,
             )
-            if (
+            anchor_injection_eligible = (
                 not live_local_session_exists
                 and not forwards_to_active_owner
                 and payload.previous_response_id is None
                 and bridge_session_key.strength == "hard"
                 and durable_lookup.latest_response_id is not None
                 and (not _http_bridge_payload_looks_like_full_resend(payload) or durable_anchor_trimmable)
+            )
+            # A durable anchor from a dead upstream connection can stall the fresh
+            # bridge pre-`response.created`; because the durable record keeps that
+            # anchor, every full-resend retry would stall the same way. Anchors that
+            # already caused a progress timeout are skipped while suspect, but only
+            # for full resends — they carry their own continuity. A short follow-up
+            # without the anchor would lose its conversation, so it keeps the anchor
+            # and relies on the progress deadline.
+            if (
+                anchor_injection_eligible
+                and _http_bridge_payload_looks_like_full_resend(payload)
+                and durable_lookup.latest_response_id is not None
+                and _is_suspect_durable_anchor(
+                    self._http_bridge_suspect_durable_anchors,
+                    durable_lookup.latest_response_id,
+                    _service_time().monotonic(),
+                )
             ):
+                _log_http_bridge_event(
+                    "stale_anchor_injection_skipped",
+                    bridge_session_key,
+                    account_id=None,
+                    model=payload.model,
+                    detail=f"response_id={durable_lookup.latest_response_id}",
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                )
+            elif anchor_injection_eligible:
                 effective_payload = payload.model_copy(
                     update={"previous_response_id": durable_lookup.latest_response_id}
                 )
@@ -1916,6 +1945,20 @@ class _HTTPBridgeStreamingMixin:
                                 request_state.request_id,
                                 response_create_timeout_seconds,
                             )
+                            if (
+                                request_state.proxy_injected_previous_response_id
+                                and request_state.previous_response_id is not None
+                            ):
+                                _mark_suspect_durable_anchor(
+                                    self._http_bridge_suspect_durable_anchors,
+                                    request_state.previous_response_id,
+                                    _service_time().monotonic(),
+                                )
+                                logger.warning(
+                                    "HTTP bridge suspect durable anchor recorded request_id=%s response_id=%s",
+                                    request_state.request_id,
+                                    request_state.previous_response_id,
+                                )
                             yield format_sse_event(
                                 cast(
                                     Mapping[str, JsonValue],
