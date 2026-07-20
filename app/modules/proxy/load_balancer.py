@@ -35,6 +35,10 @@ from app.core.balancer import (
 )
 from app.core.balancer.types import UpstreamError
 from app.core.config import settings as config_settings
+from app.core.config.constants import (
+    DEFAULT_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT,
+    DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+)
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.metrics.prometheus import (
@@ -116,6 +120,7 @@ class RuntimeState:
     inflight_streams: int = 0
     leased_tokens: float = 0.0
     leases: dict[str, "AccountLease"] | None = None
+    recovery_probe_status: AccountStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +334,8 @@ class LoadBalancer:
         stream_reserve_slots: int = 0,
         traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
         concurrency_caps: AccountConcurrencyCaps | None = None,
+        fresh_allocation: bool = False,
+        fresh_allocation_primary_usage_threshold_pct: float | None = None,
     ) -> AccountSelection:
         excluded_ids = set(exclude_account_ids or ())
         scoped_account_ids = None if account_ids is None else set(account_ids)
@@ -399,6 +406,17 @@ class LoadBalancer:
             return selection_inputs
 
         selection_inputs = await load_selection_inputs()
+        fresh_allocation_threshold_pct = (
+            float(fresh_allocation_primary_usage_threshold_pct)
+            if fresh_allocation_primary_usage_threshold_pct is not None
+            else float(
+                getattr(
+                    get_settings(),
+                    "fresh_allocation_primary_usage_threshold_pct",
+                    DEFAULT_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT,
+                )
+            )
+        )
         caps = concurrency_caps or effective_account_concurrency_caps()
         circuit_breaker_open = _is_upstream_circuit_breaker_open()
         if circuit_breaker_open:
@@ -465,8 +483,9 @@ class LoadBalancer:
                         _record_account_cap_rejection(lease_kind)
                     else:
                         selection_error_code = None
-                        result = _select_account_preferring_budget_safe(
+                        result = _select_account_with_fresh_allocation_guard(
                             selection_states,
+                            primary_usage_threshold_pct=(fresh_allocation_threshold_pct if fresh_allocation else None),
                             prefer_earlier_reset=prefer_earlier_reset_accounts,
                             prefer_earlier_reset_window=prefer_earlier_reset_window,
                             routing_strategy=routing_strategy,
@@ -514,6 +533,9 @@ class LoadBalancer:
                             selected_snapshot.status = result.account.status
                             selected_snapshot.deactivation_reason = result.account.deactivation_reason
                             selected_snapshot.reset_at = selected_reset_at
+                            selected_snapshot.blocked_at = (
+                                int(result.account.blocked_at) if result.account.blocked_at else None
+                            )
                     else:
                         error_message = result.error_message
 
@@ -536,11 +558,15 @@ class LoadBalancer:
                             selected_states,
                         )
                 except BaseException:
+                    if selected_snapshot is not None:
+                        self._clear_recovery_probe(selected_snapshot.id)
                     await self.release_account_lease(selected_lease)
                     selected_lease = None
                     raise
                 stale_account_ids = stale_account_ids or set()
                 if selected_snapshot is not None and selected_snapshot.id in stale_account_ids:
+                    self._clear_recovery_probe(selected_snapshot.id)
+                    self._selection_inputs_cache.invalidate()
                     await self.release_account_lease(selected_lease)
                     selected_lease = None
                     if attempt >= _MAX_SELECTION_ATTEMPTS:
@@ -565,6 +591,7 @@ class LoadBalancer:
                     and self._selection_inputs_cache.generation != pre_persist_cache_generation
                     and attempt < _MAX_SELECTION_ATTEMPTS
                 ):
+                    self._clear_recovery_probe(selected_snapshot.id)
                     await self.release_account_lease(selected_lease)
                     selected_lease = None
                     selection_inputs = await load_selection_inputs()
@@ -686,18 +713,25 @@ class LoadBalancer:
                         )
                 selected_account_map = account_map
                 selected_states = []
+                recovery_probe_conflict = False
                 async with self._runtime_lock:
-                    for state in states:
-                        account = account_map.get(state.account_id)
-                        if account is None:
-                            continue
-                        self._sync_runtime_state(
-                            account,
-                            state,
-                            selected=result.account is not None and state.account_id == result.account.account_id,
+                    if result.account is not None and result.account.recovery_probe_status is not None:
+                        selected_runtime = self._runtime.get(result.account.account_id)
+                        recovery_probe_conflict = bool(
+                            selected_runtime is not None and selected_runtime.recovery_probe_status is not None
                         )
-                        selected_states.append(state)
-                    if result.account is not None:
+                    if not recovery_probe_conflict:
+                        for state in states:
+                            account = account_map.get(state.account_id)
+                            if account is None:
+                                continue
+                            self._sync_runtime_state(
+                                account,
+                                state,
+                                selected=result.account is not None and state.account_id == result.account.account_id,
+                            )
+                            selected_states.append(state)
+                    if result.account is not None and not recovery_probe_conflict:
                         selected = account_map.get(result.account.account_id)
                         if selected is None:
                             error_message = result.error_message
@@ -713,6 +747,9 @@ class LoadBalancer:
                             selected_snapshot.status = result.account.status
                             selected_snapshot.deactivation_reason = result.account.deactivation_reason
                             selected_snapshot.reset_at = selected_reset_at
+                            selected_snapshot.blocked_at = (
+                                int(result.account.blocked_at) if result.account.blocked_at else None
+                            )
                             if lease_kind is not None:
                                 if not self._account_lease_allowed_locked(
                                     selected.id,
@@ -730,7 +767,21 @@ class LoadBalancer:
                                         estimated_tokens=estimated_lease_tokens,
                                     )
                     else:
-                        error_message = result.error_message
+                        error_message = result.error_message or "No available accounts"
+
+                if recovery_probe_conflict:
+                    selected_account_map = {}
+                    if attempt >= _MAX_SELECTION_ATTEMPTS:
+                        break
+                    selection_inputs = await load_selection_inputs()
+                    if selection_inputs.error_code is not None and not selection_inputs.accounts:
+                        return AccountSelection(
+                            account=None,
+                            error_message=selection_inputs.error_message,
+                            error_code=selection_inputs.error_code,
+                        )
+                    await asyncio.sleep(0)
+                    continue
 
                 try:
                     async with self._repo_factory() as repos:
@@ -740,11 +791,15 @@ class LoadBalancer:
                             selected_states,
                         )
                 except BaseException:
+                    if selected_snapshot is not None:
+                        self._clear_recovery_probe(selected_snapshot.id)
                     await self.release_account_lease(selected_lease)
                     selected_lease = None
                     raise
                 stale_account_ids = stale_account_ids or set()
                 if selected_snapshot is not None and selected_snapshot.id in stale_account_ids:
+                    self._clear_recovery_probe(selected_snapshot.id)
+                    self._selection_inputs_cache.invalidate()
                     await self.release_account_lease(selected_lease)
                     selected_lease = None
                     selected_snapshot = None
@@ -1491,6 +1546,7 @@ class LoadBalancer:
         async with lock:
             state = self._state_for(account)
             handle_rate_limit(state, error)
+            self._clear_recovery_probe(account.id)
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
                 await self._persist_state(repos.accounts, account, state)
@@ -1501,6 +1557,7 @@ class LoadBalancer:
         async with lock:
             state = self._state_for(account)
             handle_quota_exceeded(state, error)
+            self._clear_recovery_probe(account.id)
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
                 await self._persist_state(repos.accounts, account, state)
@@ -1511,6 +1568,7 @@ class LoadBalancer:
         async with lock:
             state = self._state_for(account)
             handle_permanent_failure(state, error_code)
+            self._clear_recovery_probe(account.id)
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
                 await self._persist_state(repos.accounts, account, state)
@@ -1526,6 +1584,25 @@ class LoadBalancer:
             return
         lock = await self._get_account_lock(account.id)
         async with lock:
+            runtime = self._runtime.get(account.id)
+            expected_probe_blocked_at = (
+                int(runtime.blocked_at)
+                if runtime is not None and runtime.recovery_probe_status is not None and runtime.blocked_at is not None
+                else None
+            )
+            if (
+                runtime
+                and runtime.recovery_probe_status is not None
+                and account.status == AccountStatus.ACTIVE
+                and account.blocked_at == expected_probe_blocked_at
+            ):
+                runtime.recovery_probe_status = None
+                runtime.error_count += count
+                runtime.last_error_at = time.time()
+                runtime.probe_success_streak = 0
+                runtime.version += 1
+                self._selection_inputs_cache.invalidate()
+                return
             account_snapshot = _clone_account(account)
             state = self._state_for(account)
             state.error_count += count
@@ -1542,6 +1619,42 @@ class LoadBalancer:
         lock = await self._get_account_lock(account.id)
         async with lock:
             runtime = self._runtime.get(account.id)
+            if runtime and runtime.recovery_probe_status is not None:
+                recovery_status = runtime.recovery_probe_status
+                expected_blocked_at = int(runtime.blocked_at) if runtime.blocked_at else None
+                # blocked_at is the durable probe ownership token. Older
+                # requests for this account must not settle a newer probe.
+                is_selected_probe = account.status == AccountStatus.ACTIVE and account.blocked_at == expected_blocked_at
+                if not is_selected_probe:
+                    if runtime.error_count > 0:
+                        runtime.error_count = 0
+                        runtime.last_error_at = None
+                        runtime.version += 1
+                    return
+                async with self._repo_factory() as repos:
+                    restored = await repos.accounts.update_status_if_current(
+                        account.id,
+                        AccountStatus.ACTIVE,
+                        account.deactivation_reason,
+                        None,
+                        blocked_at=None,
+                        expected_status=recovery_status,
+                        expected_deactivation_reason=account.deactivation_reason,
+                        expected_reset_at=None,
+                        expected_blocked_at=expected_blocked_at,
+                    )
+                runtime.recovery_probe_status = None
+                if restored:
+                    runtime.reset_at = None
+                    runtime.blocked_at = None
+                    runtime.error_count = 0
+                    runtime.last_error_at = None
+                    account.status = AccountStatus.ACTIVE
+                    account.reset_at = None
+                    account.blocked_at = None
+                runtime.version += 1
+                self._selection_inputs_cache.invalidate()
+                return
             if runtime and runtime.error_count > 0:
                 runtime.error_count = 0
                 runtime.last_error_at = None
@@ -1553,6 +1666,7 @@ class LoadBalancer:
     def _state_for(self, account: Account) -> AccountState:
         runtime = self._runtime.setdefault(account.id, RuntimeState())
         routing_policy = _normalize_account_routing_policy(getattr(account, "routing_policy", None))
+        settings = get_settings()
         return AccountState(
             account_id=account.id,
             status=account.status,
@@ -1571,6 +1685,14 @@ class LoadBalancer:
             capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
             routing_policy=routing_policy,
             ignore_standard_quota=False,
+            resetless_probe_interval_seconds=float(
+                getattr(
+                    settings,
+                    "resetless_account_probe_interval_seconds",
+                    DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+                )
+            ),
+            recovery_probe_status=runtime.recovery_probe_status,
         )
 
     def _sync_runtime_state(
@@ -1604,6 +1726,9 @@ class LoadBalancer:
         if runtime.error_count != state.error_count:
             runtime.error_count = state.error_count
             dirty = True
+        if state.recovery_probe_status is not None and runtime.recovery_probe_status != state.recovery_probe_status:
+            runtime.recovery_probe_status = state.recovery_probe_status
+            dirty = True
         if account.status != state.status:
             dirty = True
         if account.deactivation_reason != state.deactivation_reason:
@@ -1614,6 +1739,13 @@ class LoadBalancer:
         if dirty:
             runtime.version += 1
         return True
+
+    def _clear_recovery_probe(self, account_id: str) -> None:
+        runtime = self._runtime.get(account_id)
+        if runtime is None or runtime.recovery_probe_status is None:
+            return
+        runtime.recovery_probe_status = None
+        runtime.version += 1
 
     async def _persist_selection_state(
         self,
@@ -1640,7 +1772,8 @@ class LoadBalancer:
     ) -> None:
         reset_at_int = int(state.reset_at) if state.reset_at else None
         blocked_at_int = int(state.blocked_at) if state.blocked_at else None
-        status_changed = account.status != state.status
+        persisted_status = _persisted_status(state)
+        status_changed = account.status != persisted_status
         reason_changed = account.deactivation_reason != state.deactivation_reason
         reset_changed = account.reset_at != reset_at_int
         blocked_changed = account.blocked_at != blocked_at_int
@@ -1648,12 +1781,12 @@ class LoadBalancer:
         if status_changed or reason_changed or reset_changed or blocked_changed:
             await accounts_repo.update_status(
                 account.id,
-                state.status,
+                persisted_status,
                 state.deactivation_reason,
                 reset_at_int,
                 blocked_at=blocked_at_int,
             )
-            account.status = state.status
+            account.status = persisted_status
             account.deactivation_reason = state.deactivation_reason
             account.reset_at = reset_at_int
             account.blocked_at = blocked_at_int
@@ -1666,7 +1799,8 @@ class LoadBalancer:
     ) -> bool:
         reset_at_int = int(state.reset_at) if state.reset_at else None
         blocked_at_int = int(state.blocked_at) if state.blocked_at else None
-        status_changed = account.status != state.status
+        persisted_status = _persisted_status(state)
+        status_changed = account.status != persisted_status
         reason_changed = account.deactivation_reason != state.deactivation_reason
         reset_changed = account.reset_at != reset_at_int
         blocked_changed = account.blocked_at != blocked_at_int
@@ -1674,7 +1808,7 @@ class LoadBalancer:
         if status_changed or reason_changed or reset_changed or blocked_changed:
             updated = await accounts_repo.update_status_if_current(
                 account.id,
-                state.status,
+                persisted_status,
                 state.deactivation_reason,
                 reset_at_int,
                 blocked_at=blocked_at_int,
@@ -1684,7 +1818,7 @@ class LoadBalancer:
                 expected_blocked_at=account.blocked_at,
             )
             if updated:
-                account.status = state.status
+                account.status = persisted_status
                 account.deactivation_reason = state.deactivation_reason
                 account.reset_at = reset_at_int
                 account.blocked_at = blocked_at_int
@@ -1699,6 +1833,12 @@ class LoadBalancer:
     ) -> None:
         self._sync_runtime_state(account, state)
         await self._persist_state(accounts_repo, account, state)
+
+
+def _persisted_status(state: AccountState) -> AccountStatus:
+    if state.status == AccountStatus.ACTIVE and state.recovery_probe_status is not None:
+        return state.recovery_probe_status
+    return state.status
 
 
 def _build_states(
@@ -1902,6 +2042,9 @@ def _state_from_account(
     runtime: RuntimeState,
 ) -> AccountState:
     routing_policy = _normalize_account_routing_policy(getattr(account, "routing_policy", None))
+    settings = get_settings()
+    observed_primary_used = primary_entry.used_percent if primary_entry else None
+    observed_primary_reset = primary_entry.reset_at if primary_entry else None
     primary_used = primary_entry.used_percent if primary_entry else None
     primary_reset = primary_entry.reset_at if primary_entry else None
     primary_window_minutes = primary_entry.window_minutes if primary_entry else None
@@ -1974,11 +2117,21 @@ def _state_from_account(
     db_reset_at = (
         None if ignore_zero_capacity_primary_runtime_reset else (float(account.reset_at) if account.reset_at else None)
     )
+    resetless_blocked_status = (
+        status_seed
+        if status_seed in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED)
+        and db_reset_at is None
+        and runtime.reset_at is None
+        else None
+    )
     if status_seed in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED) or runtime.blocked_at is not None:
         effective_runtime_reset = db_reset_at or runtime.reset_at
     else:
         effective_runtime_reset = None
-    effective_blocked_at = float(account.blocked_at) if account.blocked_at is not None else runtime.blocked_at
+    if runtime.recovery_probe_status is not None and runtime.blocked_at is not None:
+        effective_blocked_at = runtime.blocked_at
+    else:
+        effective_blocked_at = float(account.blocked_at) if account.blocked_at is not None else runtime.blocked_at
 
     if (
         account.status == AccountStatus.QUOTA_EXCEEDED
@@ -2040,6 +2193,13 @@ def _state_from_account(
         infer_status_from_usage=False,
     )
 
+    if resetless_blocked_status is not None:
+        status = resetless_blocked_status
+        reset_at = None
+    if runtime.recovery_probe_status is not None and account.status == runtime.recovery_probe_status:
+        status = account.status
+        reset_at = None
+
     if status == AccountStatus.QUOTA_EXCEEDED:
         next_blocked_at = effective_blocked_at
     elif status == AccountStatus.RATE_LIMITED and account.status != AccountStatus.QUOTA_EXCEEDED:
@@ -2047,7 +2207,6 @@ def _state_from_account(
     else:
         next_blocked_at = None
 
-    settings = get_settings()
     if getattr(settings, "soft_drain_enabled", True):
         new_tier = evaluate_health_tier(
             AccountState(
@@ -2104,6 +2263,8 @@ def _state_from_account(
         used_percent=effective_used_percent,
         reset_at=reset_at,
         primary_reset_at=primary_reset,
+        observed_primary_used_percent=observed_primary_used,
+        observed_primary_reset_at=observed_primary_reset,
         blocked_at=next_blocked_at,
         cooldown_until=runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
@@ -2119,6 +2280,14 @@ def _state_from_account(
         inflight_streams=runtime.inflight_streams,
         leased_tokens=runtime.leased_tokens,
         routing_policy=routing_policy,
+        resetless_probe_interval_seconds=float(
+            getattr(
+                settings,
+                "resetless_account_probe_interval_seconds",
+                DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+            )
+        ),
+        recovery_probe_status=runtime.recovery_probe_status,
     )
 
 
@@ -2499,6 +2668,55 @@ def _state_above_sticky_budget_threshold(
     return (used_percent is not None and used_percent > budget_threshold_pct) or (
         secondary_used_percent is not None and secondary_used_percent > secondary_threshold
     )
+
+
+def _select_account_with_fresh_allocation_guard(
+    states: Iterable[AccountState],
+    *,
+    primary_usage_threshold_pct: float | None,
+    prefer_earlier_reset: bool,
+    prefer_earlier_reset_window: ResetPreferenceWindow,
+    routing_strategy: RoutingStrategy,
+    relative_availability_power: float,
+    relative_availability_top_k: int,
+    budget_threshold_pct: float,
+    secondary_budget_threshold_pct: float,
+    traffic_class: TrafficClass,
+    ignore_standard_quota: bool,
+    routing_costs_by_account_id: RoutingCostsByAccount | None,
+) -> SelectionResult:
+    state_list = list(states)
+    guarded_states = (
+        [
+            state
+            for state in state_list
+            if state.observed_primary_used_percent is None
+            or state.observed_primary_used_percent < primary_usage_threshold_pct
+        ]
+        if primary_usage_threshold_pct is not None
+        else []
+    )
+
+    def select_from(pool: list[AccountState]) -> SelectionResult:
+        return _select_account_preferring_budget_safe(
+            pool,
+            prefer_earlier_reset=prefer_earlier_reset,
+            prefer_earlier_reset_window=prefer_earlier_reset_window,
+            routing_strategy=routing_strategy,
+            relative_availability_power=relative_availability_power,
+            relative_availability_top_k=relative_availability_top_k,
+            budget_threshold_pct=budget_threshold_pct,
+            secondary_budget_threshold_pct=secondary_budget_threshold_pct,
+            traffic_class=traffic_class,
+            ignore_standard_quota=ignore_standard_quota,
+            routing_costs_by_account_id=routing_costs_by_account_id,
+        )
+
+    if guarded_states:
+        guarded = select_from(guarded_states)
+        if guarded.account is not None:
+            return guarded
+    return select_from(state_list)
 
 
 def _select_account_preferring_budget_safe(

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Collection, Iterable, Literal
 
 from app.core.balancer.types import FailureClass, UpstreamError
+from app.core.config.constants import DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS
 from app.core.usage import PLAN_CAPACITY_CREDITS_SECONDARY
 from app.core.utils.retry import backoff_seconds, parse_retry_after
 from app.db.models import AccountStatus
@@ -113,6 +114,8 @@ class AccountState:
     used_percent: float | None = None
     reset_at: float | None = None
     primary_reset_at: int | None = None
+    observed_primary_used_percent: float | None = None
+    observed_primary_reset_at: int | None = None
     blocked_at: float | None = None
     cooldown_until: float | None = None
     secondary_used_percent: float | None = None
@@ -134,6 +137,9 @@ class AccountState:
     leased_tokens: float = 0.0
     routing_policy: str = ROUTING_POLICY_NORMAL
     ignore_standard_quota: bool = False
+    resetless_probe_interval_seconds: float = DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS
+    recovery_probe_status: AccountStatus | None = None
+    recovery_probe_ready: bool = False
 
 
 @dataclass
@@ -444,19 +450,23 @@ def select_account(
         if state.status == AccountStatus.PAUSED:
             continue
         if state.status == AccountStatus.RATE_LIMITED:
-            if state.reset_at and current >= state.reset_at:
-                state.status = AccountStatus.ACTIVE
-                state.used_percent = 0.0
-                state.error_count = 0
-                state.reset_at = None
+            if _recover_blocked_account(
+                state,
+                current=current,
+                reset_secondary_usage=False,
+                allow_resetless_probe=not bypass_standard_quota,
+            ):
+                pass
             elif not bypass_standard_quota:
                 continue
         if state.status == AccountStatus.QUOTA_EXCEEDED:
-            if state.reset_at and current >= state.reset_at:
-                state.status = AccountStatus.ACTIVE
-                state.used_percent = 0.0
-                state.secondary_used_percent = 0.0
-                state.reset_at = None
+            if _recover_blocked_account(
+                state,
+                current=current,
+                reset_secondary_usage=True,
+                allow_resetless_probe=not bypass_standard_quota,
+            ):
+                pass
             elif not bypass_standard_quota:
                 continue
         if state.cooldown_until and current >= state.cooldown_until:
@@ -583,15 +593,15 @@ def select_account(
 
     if routing_strategy == "single_account":
         selected = min(available, key=lambda state: state.account_id)
-        return SelectionResult(selected, None)
+        return _selected_result(selected, current)
 
     if routing_strategy == "sequential_drain":
         selected = min(available, key=_sequential_drain_sort_key)
-        return SelectionResult(selected, None)
+        return _selected_result(selected, current)
 
     if routing_strategy == "reset_drain":
         selected = min(available, key=lambda state: _reset_drain_sort_key(state, current))
-        return SelectionResult(selected, None)
+        return _selected_result(selected, current)
 
     healthy = [s for s in available if s.health_tier == HEALTH_TIER_HEALTHY]
     probing = [s for s in available if s.health_tier == HEALTH_TIER_PROBING]
@@ -650,6 +660,63 @@ def select_account(
                 effective_pool,
                 key=_reset_first_sort_key if effective_prefer_earlier_reset else _usage_sort_key_with_cost,
             )
+    return _selected_result(selected, current)
+
+
+def _recover_blocked_account(
+    state: AccountState,
+    *,
+    current: float,
+    reset_secondary_usage: bool,
+    allow_resetless_probe: bool,
+) -> bool:
+    if state.recovery_probe_status is not None:
+        return False
+
+    effective_reset_at = state.reset_at
+    if effective_reset_at is None:
+        effective_reset_at = state.observed_primary_reset_at
+
+    if effective_reset_at is not None:
+        if current < effective_reset_at:
+            return False
+        state.status = AccountStatus.ACTIVE
+        state.used_percent = 0.0
+        if reset_secondary_usage:
+            state.secondary_used_percent = 0.0
+        state.error_count = 0
+        state.last_error_at = None
+        state.reset_at = None
+        state.blocked_at = None
+        state.recovery_probe_status = None
+        return True
+
+    if not allow_resetless_probe:
+        return False
+    if state.blocked_at is None:
+        state.blocked_at = current
+        return False
+    if current < state.blocked_at + state.resetless_probe_interval_seconds:
+        return False
+
+    state.recovery_probe_ready = True
+    return True
+
+
+def _selected_result(selected: AccountState, current: float) -> SelectionResult:
+    if selected.recovery_probe_ready:
+        selected.recovery_probe_ready = False
+        selected.recovery_probe_status = selected.status
+        selected.status = AccountStatus.ACTIVE
+        selected.used_percent = 0.0
+        if selected.recovery_probe_status == AccountStatus.QUOTA_EXCEEDED:
+            selected.secondary_used_percent = 0.0
+        selected.error_count = 0
+        selected.last_error_at = None
+        selected.reset_at = None
+        # The advanced marker bounds the next attempt and identifies this
+        # detached probe snapshot when its outcome is settled.
+        selected.blocked_at = current
     return SelectionResult(selected, None)
 
 
@@ -975,6 +1042,8 @@ def _select_fill_first(available: list[AccountState]) -> AccountState:
 
 
 def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
+    state.recovery_probe_status = None
+    state.recovery_probe_ready = False
     state.status = AccountStatus.RATE_LIMITED
     state.error_count += 1
     state.last_error_at = time.time()
@@ -1011,6 +1080,9 @@ def _format_retry_hint(wait_seconds: float) -> str:
 
 
 def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
+    was_recovery_probe = state.recovery_probe_status is not None
+    state.recovery_probe_status = None
+    state.recovery_probe_ready = False
     state.status = AccountStatus.QUOTA_EXCEEDED
     state.used_percent = 100.0
     state.blocked_at = time.time()
@@ -1019,11 +1091,13 @@ def handle_quota_exceeded(state: AccountState, error: UpstreamError) -> None:
     reset_at = _extract_reset_at(error)
     if reset_at is not None:
         state.reset_at = reset_at
-    else:
+    elif not was_recovery_probe:
         state.reset_at = int(time.time() + 3600)
 
 
 def handle_permanent_failure(state: AccountState, error_code: str) -> None:
+    state.recovery_probe_status = None
+    state.recovery_probe_ready = False
     state.status = account_status_for_permanent_failure(error_code)
     state.deactivation_reason = PERMANENT_FAILURE_CODES.get(
         error_code,

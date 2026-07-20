@@ -38,7 +38,7 @@ from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.core.utils.request_id import get_request_id, reset_request_id, set_request_id
 from app.core.utils.sse import parse_sse_data_json
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, StickySessionKind
 from app.modules.accounts import auth_manager as auth_manager_module
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -4384,6 +4384,7 @@ async def test_select_codex_control_account_without_budget_uses_balancer(monkeyp
         secondary_budget_threshold_pct=100.0,
         traffic_class=proxy_service.TRAFFIC_CLASS_FOREGROUND,
         concurrency_caps=ANY,
+        fresh_allocation=False,
     )
 
 
@@ -4417,6 +4418,7 @@ async def test_select_codex_control_account_without_budget_honors_traffic_class(
     assert result is None
     assert select_account.await_args is not None
     assert select_account.await_args.kwargs["traffic_class"] == proxy_service.TRAFFIC_CLASS_OPPORTUNISTIC
+    assert select_account.await_args.kwargs["fresh_allocation"] is True
 
 
 @pytest.fixture(autouse=True)
@@ -25339,6 +25341,48 @@ async def test_select_account_with_budget_reserves_stream_slot_for_reattach(
     assert select_account.await_args.kwargs["stream_reserve_slots"] == expected_reserve
     assert settings.proxy_account_response_create_limit == 12
     assert settings.proxy_account_stream_limit == 24
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_stage", "sticky_key", "preferred_account_id", "expected_fresh_allocation"),
+    [
+        ("first_turn", None, None, True),
+        ("follow_up", None, None, False),
+        ("reattach", None, None, False),
+        ("first_turn", "sticky-session", None, False),
+        ("first_turn", None, "acc-fresh-allocation-intent", False),
+    ],
+)
+async def test_select_account_with_budget_forwards_fresh_allocation_intent(
+    monkeypatch,
+    request_stage,
+    sticky_key,
+    preferred_account_id,
+    expected_fresh_allocation,
+):
+    settings = _make_proxy_settings(log_proxy_service_tier_trace=False)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc-fresh-allocation-intent")
+    select_account = AsyncMock(return_value=AccountSelection(account=account, error_message=None))
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(proxy_service, "_remaining_budget_seconds", lambda _deadline: 10.0)
+
+    await service._select_account_with_budget(
+        deadline=123.0,
+        request_id=f"req-{request_stage}",
+        kind="http_bridge",
+        request_stage=request_stage,
+        sticky_key=sticky_key,
+        sticky_kind=StickySessionKind.CODEX_SESSION if sticky_key is not None else None,
+        model="gpt-5.6-sol",
+        preferred_account_id=preferred_account_id,
+    )
+
+    assert select_account.await_args is not None
+    assert select_account.await_args.kwargs["fresh_allocation"] is expected_fresh_allocation
 
 
 @pytest.mark.asyncio

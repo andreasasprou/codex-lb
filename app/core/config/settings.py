@@ -15,6 +15,10 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.core.auth.dashboard_mode import DashboardAuthMode, normalize_dashboard_auth_proxy_header
+from app.core.config.constants import (
+    DEFAULT_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT,
+    DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+)
 from app.core.utils.proxy_env import outbound_proxy_env_configured
 
 BASE_DIR = Path(__file__).resolve().parents[3]
@@ -308,6 +312,15 @@ class Settings(BaseSettings):
     drain_error_count_threshold: int = 2
     probe_quiet_seconds: float = 60.0
     probe_success_streak_required: int = 3
+    resetless_account_probe_interval_seconds: float = Field(
+        default=DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+        gt=0.0,
+    )
+    fresh_allocation_primary_usage_threshold_pct: float = Field(
+        default=DEFAULT_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT,
+        ge=0.0,
+        le=100.0,
+    )
 
     # Backpressure
     backpressure_max_concurrent_requests: int = 0  # 0 = unlimited
