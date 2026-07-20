@@ -599,6 +599,7 @@ async def run_sticky_selection_path(
                     selected_snapshot.status = result.account.status
                     selected_snapshot.deactivation_reason = result.account.deactivation_reason
                     selected_snapshot.reset_at = selected_reset_at
+                    selected_snapshot.blocked_at = int(result.account.blocked_at) if result.account.blocked_at else None
 
         if probe_reservation_invalidated:
             selected_snapshot = None
@@ -1425,6 +1426,55 @@ def _select_account_preferring_budget_safe(
         ignore_standard_quota=ignore_standard_quota,
         routing_costs=routing_costs_by_account_id,
     )
+
+
+def _select_account_with_fresh_allocation_guard(
+    states: Iterable[AccountState],
+    *,
+    primary_usage_threshold_pct: float | None,
+    prefer_earlier_reset: bool,
+    prefer_earlier_reset_window: ResetPreferenceWindow,
+    routing_strategy: RoutingStrategy,
+    relative_availability_power: float,
+    relative_availability_top_k: int,
+    budget_threshold_pct: float,
+    secondary_budget_threshold_pct: float,
+    traffic_class: TrafficClass,
+    ignore_standard_quota: bool,
+    routing_costs_by_account_id: RoutingCostsByAccount | None,
+) -> SelectionResult:
+    state_list = list(states)
+    guarded_states = (
+        [
+            state
+            for state in state_list
+            if state.observed_primary_used_percent is None
+            or state.observed_primary_used_percent < primary_usage_threshold_pct
+        ]
+        if primary_usage_threshold_pct is not None
+        else []
+    )
+
+    def select_from(pool: list[AccountState]) -> SelectionResult:
+        return _select_account_preferring_budget_safe(
+            pool,
+            prefer_earlier_reset=prefer_earlier_reset,
+            prefer_earlier_reset_window=prefer_earlier_reset_window,
+            routing_strategy=routing_strategy,
+            relative_availability_power=relative_availability_power,
+            relative_availability_top_k=relative_availability_top_k,
+            budget_threshold_pct=budget_threshold_pct,
+            secondary_budget_threshold_pct=secondary_budget_threshold_pct,
+            traffic_class=traffic_class,
+            ignore_standard_quota=ignore_standard_quota,
+            routing_costs_by_account_id=routing_costs_by_account_id,
+        )
+
+    if guarded_states:
+        guarded = select_from(guarded_states)
+        if guarded.account is not None:
+            return guarded
+    return select_from(state_list)
 
 
 def _best_health_tier_states(states: list[AccountState]) -> list[AccountState]:

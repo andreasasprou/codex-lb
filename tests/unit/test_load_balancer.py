@@ -26,6 +26,7 @@ from app.core.balancer import (
     select_account,
 )
 from app.core.balancer.logic import DRAIN_PRIMARY_THRESHOLD_PCT, PROBE_QUIET_SECONDS
+from app.core.config.settings import Settings
 from app.core.usage.quota import apply_usage_quota
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.modules.proxy.load_balancer import (
@@ -42,6 +43,16 @@ from app.modules.proxy.load_balancer import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_balancer_recovery_tunables_support_environment_overrides(monkeypatch):
+    monkeypatch.setenv("CODEX_LB_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS", "1200")
+    monkeypatch.setenv("CODEX_LB_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT", "87.5")
+
+    settings = Settings()
+
+    assert settings.resetless_account_probe_interval_seconds == 1200.0
+    assert settings.fresh_allocation_primary_usage_threshold_pct == 87.5
 
 
 def test_select_account_picks_lowest_used_percent():
@@ -1529,6 +1540,130 @@ def test_select_account_resets_secondary_used_percent_when_quota_exceeded_expire
     assert state.reset_at is None
 
 
+@pytest.mark.parametrize("status", [AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED])
+def test_select_account_recovers_null_reset_from_observed_primary_reset(status):
+    now = 1_700_000_000.0
+    state = AccountState(
+        "usage-reset",
+        status,
+        used_percent=100.0,
+        reset_at=None,
+        observed_primary_reset_at=int(now - 1),
+    )
+
+    result = select_account([state], now=now)
+
+    assert result.account is state
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
+    assert state.blocked_at is None
+
+
+def test_select_account_preserves_persisted_reset_precedence_over_observed_primary_reset():
+    now = 1_700_000_000.0
+    state = AccountState(
+        "persisted-reset",
+        AccountStatus.RATE_LIMITED,
+        used_percent=100.0,
+        reset_at=now + 300,
+        observed_primary_reset_at=int(now - 1),
+    )
+
+    result = select_account([state], now=now)
+
+    assert result.account is None
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == now + 300
+
+
+def test_select_account_does_not_recover_observed_reset_while_probe_is_in_flight():
+    now = 1_700_000_000.0
+    state = AccountState(
+        "probe-in-flight",
+        AccountStatus.RATE_LIMITED,
+        reset_at=None,
+        observed_primary_reset_at=int(now - 1),
+        blocked_at=now,
+        recovery_probe_status=AccountStatus.RATE_LIMITED,
+    )
+
+    result = select_account([state], now=now)
+
+    assert result.account is None
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.recovery_probe_status == AccountStatus.RATE_LIMITED
+
+
+def test_select_account_bounds_resetless_reprobe_after_failure(monkeypatch):
+    now = 1_700_000_000.0
+    state = AccountState(
+        "resetless",
+        AccountStatus.RATE_LIMITED,
+        reset_at=None,
+        blocked_at=now - 901,
+        resetless_probe_interval_seconds=900.0,
+    )
+
+    first_probe = select_account([state], now=now)
+
+    assert first_probe.account is state
+    assert state.recovery_probe_status == AccountStatus.RATE_LIMITED
+    assert state.blocked_at == now
+
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now + 1)
+    handle_rate_limit(state, {"message": "rate limit"})
+
+    immediate_retry = select_account([state], now=now + 2)
+    next_probe = select_account([state], now=now + 902)
+
+    assert immediate_retry.account is None
+    assert next_probe.account is state
+
+
+def test_select_account_bounds_resetless_reprobe_after_quota_failure(monkeypatch):
+    now = 1_700_000_000.0
+    state = AccountState(
+        "resetless-quota",
+        AccountStatus.QUOTA_EXCEEDED,
+        reset_at=None,
+        blocked_at=now - 901,
+        resetless_probe_interval_seconds=900.0,
+    )
+
+    first_probe = select_account([state], now=now)
+
+    assert first_probe.account is state
+
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now + 1)
+    handle_quota_exceeded(state, {"message": "quota exceeded"})
+
+    immediate_retry = select_account([state], now=now + 2)
+    next_probe = select_account([state], now=now + 902)
+
+    assert state.reset_at is None
+    assert immediate_retry.account is None
+    assert next_probe.account is state
+
+
+def test_select_account_anchors_legacy_resetless_probe_interval():
+    now = 1_700_000_000.0
+    state = AccountState(
+        "legacy-resetless",
+        AccountStatus.QUOTA_EXCEEDED,
+        reset_at=None,
+        blocked_at=None,
+        resetless_probe_interval_seconds=900.0,
+    )
+
+    initial = select_account([state], now=now)
+    early = select_account([state], now=now + 899)
+    probe = select_account([state], now=now + 900)
+
+    assert initial.account is None
+    assert early.account is None
+    assert probe.account is state
+
+
 def test_apply_usage_quota_clears_quota_exceeded_when_runtime_reset_is_none(monkeypatch):
     now = 1_700_000_000.0
     monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
@@ -1912,7 +2047,7 @@ def test_state_from_account_clears_stale_advisory_account_reset_for_active_accou
     assert now + 0.18 <= state.cooldown_until <= now + 0.22
 
 
-def test_state_from_account_floors_resetless_rate_limited_row_instead_of_advisory_reset(
+def test_state_from_account_preserves_resetless_rate_limit_for_observed_reset_recovery(
     monkeypatch,
 ):
     now = 1_700_000_000.0
@@ -1942,7 +2077,105 @@ def test_state_from_account_floors_resetless_rate_limited_row_instead_of_advisor
     assert state.used_percent == 100.0
     assert state.reset_at == pytest.approx(blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS)
     assert state.primary_reset_at == future_reset
+    assert state.observed_primary_reset_at == future_reset
     assert state.cooldown_until == cooldown_until
+
+    before_reset = select_account([state], now=now)
+    after_reset = select_account([state], now=future_reset + 1)
+
+    assert before_reset.account is None
+    assert after_reset.account is state
+    assert state.status == AccountStatus.ACTIVE
+
+
+def test_state_from_account_preserves_resetless_rate_limit_for_bounded_probe(monkeypatch):
+    now = 1_700_000_000.0
+    blocked_at = now - 60
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    state = _state_from_account(
+        account=_make_test_account(
+            status=AccountStatus.RATE_LIMITED,
+            reset_at=None,
+            blocked_at=int(blocked_at),
+        ),
+        primary_entry=_make_test_usage(
+            window="primary",
+            used_percent=100.0,
+            reset_at=None,
+            recorded_at=_epoch_to_naive_utc(now - 30),
+        ),
+        secondary_entry=None,
+        runtime=RuntimeState(),
+    )
+
+    before_interval = select_account([state], now=now + 839)
+    after_interval = select_account([state], now=now + 840)
+
+    assert before_interval.account is None
+    assert after_interval.account is state
+    assert state.recovery_probe_status == AccountStatus.RATE_LIMITED
+
+
+def test_state_from_account_preserves_resetless_quota_for_observed_primary_reset(monkeypatch):
+    now = 1_700_000_000.0
+    observed_reset = int(now + 300)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    state = _state_from_account(
+        account=_make_test_account(
+            status=AccountStatus.QUOTA_EXCEEDED,
+            reset_at=None,
+            blocked_at=int(now - 60),
+        ),
+        primary_entry=_make_test_usage(
+            window="primary",
+            used_percent=10.0,
+            reset_at=observed_reset,
+            recorded_at=_epoch_to_naive_utc(now - 30),
+        ),
+        secondary_entry=_make_test_usage(
+            window="secondary",
+            used_percent=10.0,
+            reset_at=int(now + 3600),
+            recorded_at=_epoch_to_naive_utc(now - 30),
+        ),
+        runtime=RuntimeState(),
+    )
+
+    before_reset = select_account([state], now=now)
+    after_reset = select_account([state], now=observed_reset + 1)
+
+    assert before_reset.account is None
+    assert after_reset.account is state
+    assert state.status == AccountStatus.ACTIVE
+
+
+def test_state_from_account_preserves_raw_weekly_primary_observation_for_recovery(monkeypatch):
+    now = 1_700_000_000.0
+    observed_reset = int(now + 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    state = _state_from_account(
+        account=_make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=None, plan_type="free"),
+        primary_entry=_make_test_usage(
+            window="primary",
+            used_percent=100.0,
+            reset_at=observed_reset,
+            recorded_at=_epoch_to_naive_utc(now - 30),
+            window_minutes=10080,
+        ),
+        secondary_entry=None,
+        runtime=RuntimeState(blocked_at=now - 60),
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at is None
+    assert state.observed_primary_used_percent == 100.0
+    assert state.observed_primary_reset_at == observed_reset
 
 
 def test_state_from_account_keeps_active_account_selectable_when_secondary_usage_snapshot_is_exhausted(

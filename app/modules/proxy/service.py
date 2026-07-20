@@ -1445,6 +1445,7 @@ class ProxyService(
             secondary_budget_threshold_pct=_sticky_reallocation_secondary_budget_threshold_pct(settings),
             traffic_class=traffic_class,
             concurrency_caps=effective_account_concurrency_caps(settings),
+            fresh_allocation=affinity.key is None,
         )
         if selection.account is None:
             return None
@@ -1764,6 +1765,7 @@ class ProxyService(
                 required_preferred_account = (
                     preferred_account_id is not None and not fallback_on_preferred_account_unavailable
                 )
+                fresh_allocation = request_stage == "first_turn" and sticky_key is None and preferred_account_id is None
                 required_continuity_preferred_account = (
                     required_preferred_account and preferred_account_is_continuity_owner
                 )
@@ -1864,6 +1866,7 @@ class ProxyService(
                         stream_reserve_slots=stream_reserve_slots,
                         traffic_class=effective_traffic_class,
                         concurrency_caps=concurrency_caps,
+                        fresh_allocation=False,
                     )
                     if preferred_selection.account is not None:
                         logger.info(
@@ -1918,6 +1921,10 @@ class ProxyService(
                     stream_reserve_slots=stream_reserve_slots,
                     traffic_class=effective_traffic_class,
                     concurrency_caps=concurrency_caps,
+                    fresh_allocation=fresh_allocation,
+                    fresh_allocation_primary_usage_threshold_pct=(
+                        getattr(settings, "fresh_allocation_primary_usage_threshold_pct", None)
+                    ),
                 )
                 if selection.account is not None and selection.account.id in excluded_account_ids_set:
                     logger.warning(

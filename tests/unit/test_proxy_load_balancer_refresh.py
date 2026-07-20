@@ -428,6 +428,366 @@ async def test_select_account_prefers_budget_safe_account_when_any_exist() -> No
 
 
 @pytest.mark.asyncio
+async def test_fresh_allocation_skips_high_primary_burn_first_account(monkeypatch) -> None:
+    safe_account = _make_account("acc-fresh-safe", "fresh-safe@example.com")
+    pressured_account = _make_account("acc-fresh-pressured", "fresh-pressured@example.com")
+    pressured_account.routing_policy = "burn_first"
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary = {
+        safe_account.id: UsageHistory(
+            id=1,
+            account_id=safe_account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=20.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        pressured_account.id: UsageHistory(
+            id=2,
+            account_id=pressured_account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=90.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    accounts_repo = StubAccountsRepository([safe_account, pressured_account])
+    usage_repo = StubUsageRepository(primary=primary, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(
+        routing_strategy="usage_weighted",
+        fresh_allocation=True,
+        fresh_allocation_primary_usage_threshold_pct=90.0,
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == safe_account.id
+
+
+@pytest.mark.asyncio
+async def test_fresh_allocation_uses_full_pool_when_all_accounts_are_high(monkeypatch) -> None:
+    lower = _make_account("acc-fresh-91", "fresh-91@example.com")
+    higher = _make_account("acc-fresh-96", "fresh-96@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary = {
+        lower.id: UsageHistory(
+            id=1,
+            account_id=lower.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=91.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        higher.id: UsageHistory(
+            id=2,
+            account_id=higher.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=96.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    accounts_repo = StubAccountsRepository([higher, lower])
+    usage_repo = StubUsageRepository(primary=primary, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(
+        routing_strategy="usage_weighted",
+        fresh_allocation=True,
+        fresh_allocation_primary_usage_threshold_pct=90.0,
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == lower.id
+
+
+@pytest.mark.asyncio
+async def test_fresh_allocation_uses_pressured_account_when_low_usage_alternative_is_blocked(
+    monkeypatch,
+) -> None:
+    blocked_safe = _make_account("acc-fresh-blocked-safe", "fresh-blocked-safe@example.com")
+    pressured = _make_account("acc-fresh-pressured-fallback", "fresh-pressured-fallback@example.com")
+    blocked_safe.status = AccountStatus.RATE_LIMITED
+    pressured.routing_policy = "burn_first"
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    blocked_safe.reset_at = now_epoch + 300
+    primary = {
+        blocked_safe.id: UsageHistory(
+            id=1,
+            account_id=blocked_safe.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=20.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        pressured.id: UsageHistory(
+            id=2,
+            account_id=pressured.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=90.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    accounts_repo = StubAccountsRepository([blocked_safe, pressured])
+    usage_repo = StubUsageRepository(primary=primary, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(
+        routing_strategy="usage_weighted",
+        fresh_allocation=True,
+        fresh_allocation_primary_usage_threshold_pct=90.0,
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == pressured.id
+
+
+@pytest.mark.asyncio
+async def test_sticky_selection_keeps_account_above_fresh_allocation_threshold(monkeypatch) -> None:
+    safe = _make_account("acc-sticky-safe", "sticky-safe@example.com")
+    pinned = _make_account("acc-sticky-pressured", "sticky-pressured@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary = {
+        safe.id: UsageHistory(
+            id=1,
+            account_id=safe.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=20.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        pinned.id: UsageHistory(
+            id=2,
+            account_id=pinned.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=92.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    accounts_repo = StubAccountsRepository([safe, pinned])
+    usage_repo = StubUsageRepository(primary=primary, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+
+    async def pinned_account_id(*args, **kwargs) -> str:
+        del args, kwargs
+        return pinned.id
+
+    monkeypatch.setattr(sticky_repo, "get_account_id", pinned_account_id)
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(
+        sticky_key="sticky-session",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        routing_strategy="usage_weighted",
+        budget_threshold_pct=95.0,
+        fresh_allocation=True,
+        fresh_allocation_primary_usage_threshold_pct=90.0,
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == pinned.id
+
+
+@pytest.mark.asyncio
+async def test_resetless_recovery_probe_stays_durably_blocked_until_success(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    account = _make_account("acc-resetless-probe", "resetless-probe@example.com")
+    account.status = AccountStatus.RATE_LIMITED
+    account.reset_at = None
+    account.blocked_at = int(now - 901)
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    monkeypatch.setattr(settings, "resetless_account_probe_interval_seconds", 900.0)
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    probe = await balancer.select_account()
+
+    assert probe.account is not None
+    assert probe.account.status == AccountStatus.ACTIVE
+    assert accounts_repo._accounts[0].status == AccountStatus.RATE_LIMITED
+    assert accounts_repo._accounts[0].blocked_at == int(now)
+
+    concurrent = await balancer.select_account()
+
+    assert concurrent.account is None
+
+    older_request = _make_account(account.id, "resetless-probe@example.com")
+    older_request.status = AccountStatus.ACTIVE
+    older_request.blocked_at = None
+    await balancer.record_success(older_request)
+
+    assert accounts_repo._accounts[0].status == AccountStatus.RATE_LIMITED
+    assert balancer._runtime[account.id].recovery_probe_status == AccountStatus.RATE_LIMITED
+
+    await balancer.record_success(probe.account)
+
+    assert accounts_repo._accounts[0].status == AccountStatus.ACTIVE
+    assert accounts_repo._accounts[0].reset_at is None
+    assert accounts_repo._accounts[0].blocked_at is None
+
+
+@pytest.mark.asyncio
+async def test_resetless_recovery_probe_generic_error_restarts_bounded_interval(monkeypatch) -> None:
+    clock = [1_700_000_000.0]
+    account = _make_account("acc-resetless-error", "resetless-error@example.com")
+    account.status = AccountStatus.RATE_LIMITED
+    account.reset_at = None
+    account.blocked_at = int(clock[0] - 901)
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    monkeypatch.setattr(settings, "resetless_account_probe_interval_seconds", 900.0)
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: clock[0])
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    probe = await balancer.select_account()
+
+    assert probe.account is not None
+
+    await balancer.record_error(probe.account)
+
+    assert accounts_repo._accounts[0].status == AccountStatus.RATE_LIMITED
+    assert accounts_repo._accounts[0].blocked_at == int(clock[0])
+    assert balancer._runtime[account.id].recovery_probe_status is None
+
+    clock[0] += 899
+    early = await balancer.select_account()
+    clock[0] += 2
+    next_probe = await balancer.select_account()
+
+    assert early.account is None
+    assert next_probe.account is not None
+    assert next_probe.account.id == account.id
+
+
+@pytest.mark.asyncio
+async def test_resetless_recovery_probe_success_does_not_overwrite_new_terminal_status(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    account = _make_account("acc-resetless-terminal-race", "resetless-terminal-race@example.com")
+    account.status = AccountStatus.RATE_LIMITED
+    account.reset_at = None
+    account.blocked_at = int(now - 901)
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    monkeypatch.setattr(settings, "resetless_account_probe_interval_seconds", 900.0)
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    probe = await balancer.select_account()
+
+    assert probe.account is not None
+
+    durable_account = accounts_repo._accounts[0]
+    durable_account.status = AccountStatus.DEACTIVATED
+    durable_account.deactivation_reason = "terminal update won"
+    durable_account.blocked_at = None
+
+    await balancer.record_success(probe.account)
+
+    assert durable_account.status == AccountStatus.DEACTIVATED
+    assert durable_account.deactivation_reason == "terminal update won"
+    assert balancer._runtime[account.id].recovery_probe_status is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sticky_resetless_recovery_admits_one_probe(monkeypatch) -> None:
+    now = 1_700_000_000.0
+    account = _make_account("acc-resetless-sticky-race", "resetless-sticky-race@example.com")
+    account.status = AccountStatus.RATE_LIMITED
+    account.reset_at = None
+    account.blocked_at = int(now - 901)
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    settings = load_balancer_module.get_settings()
+    monkeypatch.setattr(settings, "soft_drain_enabled", False)
+    monkeypatch.setattr(settings, "resetless_account_probe_interval_seconds", 900.0)
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    both_lookups_started = asyncio.Event()
+    release_lookups = asyncio.Event()
+    lookup_count = 0
+
+    async def pinned_account_id(
+        key: str,
+        *,
+        kind: StickySessionKind,
+        max_age_seconds: int | None = None,
+    ) -> str:
+        nonlocal lookup_count
+        del key, kind, max_age_seconds
+        lookup_count += 1
+        if lookup_count == 2:
+            both_lookups_started.set()
+        await release_lookups.wait()
+        return account.id
+
+    monkeypatch.setattr(sticky_repo, "get_account_id", pinned_account_id)
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+    first = asyncio.create_task(
+        balancer.select_account(sticky_key="sticky-race", sticky_kind=StickySessionKind.CODEX_SESSION)
+    )
+    second = asyncio.create_task(
+        balancer.select_account(sticky_key="sticky-race", sticky_kind=StickySessionKind.CODEX_SESSION)
+    )
+
+    await both_lookups_started.wait()
+    release_lookups.set()
+    results = await asyncio.gather(first, second)
+
+    probes = [result.account for result in results if result.account is not None]
+    assert len(probes) == 1
+    assert accounts_repo._accounts[0].status == AccountStatus.RATE_LIMITED
+    assert balancer._runtime[account.id].recovery_probe_status == AccountStatus.RATE_LIMITED
+
+    third = await balancer.select_account(
+        sticky_key="sticky-race",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+    )
+
+    assert third.account is None
+
+    await balancer.record_success(probes[0])
+
+    assert accounts_repo._accounts[0].status == AccountStatus.ACTIVE
+    assert accounts_repo._accounts[0].blocked_at is None
+
+
+@pytest.mark.asyncio
 async def test_budget_safe_filter_ignores_secondary_only_pressure_when_primary_safe() -> None:
     weekly_pressured_account = _make_account("acc-weekly-pressured", "weekly-pressured@example.com")
     primary_pressured_account = _make_account("acc-primary-pressured", "primary-pressured@example.com")
@@ -1858,6 +2218,7 @@ async def test_select_account_skips_stale_persistence_after_terminal_status_upda
     now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
     account = _make_account("acc-select-lockstep", "select-lockstep@example.com")
     account.status = AccountStatus.QUOTA_EXCEEDED
+    account.reset_at = now_epoch - 1
     primary_entry = UsageHistory(
         id=1,
         account_id=account.id,

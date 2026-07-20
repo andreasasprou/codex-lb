@@ -16,6 +16,10 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.core.auth.dashboard_mode import DashboardAuthMode, normalize_dashboard_auth_proxy_header
+from app.core.config.constants import (
+    DEFAULT_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT,
+    DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+)
 from app.core.utils.proxy_env import outbound_proxy_env_configured
 
 logger = logging.getLogger(__name__)
@@ -397,6 +401,15 @@ class Settings(BaseSettings):
     # constants in ``app/core/balancer/logic.py``)
     soft_drain_enabled: bool = True
     deterministic_failover_enabled: bool = True
+    resetless_account_probe_interval_seconds: float = Field(
+        default=DEFAULT_RESETLESS_ACCOUNT_PROBE_INTERVAL_SECONDS,
+        gt=0.0,
+    )
+    fresh_allocation_primary_usage_threshold_pct: float = Field(
+        default=DEFAULT_FRESH_ALLOCATION_PRIMARY_USAGE_THRESHOLD_PCT,
+        ge=0.0,
+        le=100.0,
+    )
 
     # Backpressure
     backpressure_max_concurrent_requests: int = 0  # 0 = unlimited

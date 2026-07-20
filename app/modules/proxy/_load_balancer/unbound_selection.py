@@ -24,7 +24,7 @@ from app.modules.proxy._load_balancer.sticky_selection import (
     _filter_recovery_probe_candidates,
     _filter_states_for_account_caps,
     _probing_result_requires_recovery_reservation,
-    _select_account_preferring_budget_safe,
+    _select_account_with_fresh_allocation_guard,
 )
 from app.modules.proxy._load_balancer.types import (
     MAX_SELECTION_ATTEMPTS,
@@ -69,6 +69,8 @@ class UnboundSelectionRequest(Generic[SelectionInputsT]):
     selection_inputs: SelectionInputsT
     reload_inputs: Callable[[], Awaitable[SelectionInputsT]]
     record_account_cap_rejection: AccountCapRejectionCallback
+    fresh_allocation: bool = False
+    fresh_allocation_primary_usage_threshold_pct: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +105,8 @@ async def run_unbound_selection_path(
     caps = request.concurrency_caps
     load_selection_inputs = request.reload_inputs
     _record_account_cap_rejection = request.record_account_cap_rejection
+    fresh_allocation = request.fresh_allocation
+    fresh_allocation_primary_usage_threshold_pct = request.fresh_allocation_primary_usage_threshold_pct
 
     selected_snapshot: Account | None = None
     selected_lease: AccountLease | None = None
@@ -169,8 +173,11 @@ async def run_unbound_selection_path(
                 _record_account_cap_rejection(lease_kind)
             else:
                 selection_error_code = None
-                result = _select_account_preferring_budget_safe(
+                result = _select_account_with_fresh_allocation_guard(
                     selection_states,
+                    primary_usage_threshold_pct=(
+                        fresh_allocation_primary_usage_threshold_pct if fresh_allocation else None
+                    ),
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
                     routing_strategy=routing_strategy,
@@ -261,6 +268,7 @@ async def run_unbound_selection_path(
                     selected_snapshot.status = result.account.status
                     selected_snapshot.deactivation_reason = result.account.deactivation_reason
                     selected_snapshot.reset_at = selected_reset_at
+                    selected_snapshot.blocked_at = int(result.account.blocked_at) if result.account.blocked_at else None
             elif result.account is None:
                 error_message = result.error_message
 

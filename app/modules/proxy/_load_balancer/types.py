@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from app.db.models import AccountStatus
+
 AccountLeaseKind = Literal["response_create", "stream"]
 
 MAX_SELECTION_ATTEMPTS = 4
@@ -25,6 +27,7 @@ class RuntimeState:
     inflight_streams: int = 0
     leased_tokens: float = 0.0
     leases: dict[str, AccountLease] | None = None
+    recovery_probe_status: AccountStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
