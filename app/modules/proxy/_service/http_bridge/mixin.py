@@ -510,6 +510,10 @@ class _HTTPBridgeMixin(
                     incoming_turn_state is not None
                     and forwarded_affinity is None
                     and not preserve_durable_canonical_key
+                    # A model-transition fork already isolated this request; re-deriving
+                    # the key from headers here would discard the fork key and re-fork
+                    # the same bridge forever (2026-08-03 fork-storm outage).
+                    and key.affinity_kind != "internal_model_parallel"
                 ):
                     alias_index_key = _http_bridge_turn_state_alias_key(incoming_turn_state, api_key_id)
                     alias_key = self._http_bridge_turn_state_index.get(alias_index_key)
