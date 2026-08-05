@@ -23,7 +23,7 @@ existing selector and merely stops *requiring* the pinned account when the
 request is provably safe to serve elsewhere.
 
 ## Mechanism
-1. **`_http_bridge_request_rebind_safe(payload, headers, request_state)`** —
+1. **`_http_bridge_request_rebind_safe(payload, headers, request_state, durable_lookup)`** —
    new pure helper. True iff ALL:
    - `request_state.previous_response_id` is None (body carries no upstream
      continuity ref)
@@ -34,11 +34,11 @@ request is provably safe to serve elsewhere.
      echo returned turn state (`affinity.py:233-246`, ops.md — Lu-r2-3).
    - `extract_input_file_ids(payload.input)` is empty (categorical file
      exclusion — S2/L2)
-   - self-contained replay: `_http_bridge_payload_looks_like_full_resend`
-     AND `len(payload.input) >= durable_lookup.latest_input_item_count` (full
-     history grows, trimmed/current-turn payloads shrink; fail closed when the
-     stored count is absent — S-r2-1, defeats the single-large-message case)
-     AND causal closure, generalized from the websocket replay-safety check
+   - self-contained replay: `_http_bridge_payload_looks_like_full_resend`, the
+     strict account-neutral replay validator, and
+     `_input_prefix_matches_stored_context` against the existing durable count
+     and fingerprint. Missing or mismatched proof fails closed. Causal closure
+     is generalized from the websocket replay-safety check
      (`websocket/helpers.py:443-489`): ≥1 `message` item and ANY input item
      whose type ends with `_call_output` (function/custom/apply_patch/
      computer/…, future-proof — Lu-r3-2) must have a matching earlier call
@@ -85,9 +85,11 @@ request is provably safe to serve elsewhere.
    The selector remains the single authority on why the preferred account is
    unusable — no duplicated availability logic.
 
-4. After fallback selection, fresh bridge goes unanchored for full resends
-   (4aad503e, `streaming.py:779-812`); canonical durable row rewritten on
-   claim, stale aliases cleared (`durable_bridge_repository.py:217`).
+4. Every rebind-safe path that moves from the preferred account uses empty
+   selection affinity and strips session-affinity headers before connecting.
+   The canonical durable row is rewritten on claim and stale aliases are
+   cleared. Account-change claims preserve the stored count and fingerprint
+   until completed-response registration replaces them.
 
 ## Accepted residual risks (dispositions)
 - S6/S8 (narrowed per round 2): a still-open session on the exhausted account
@@ -113,6 +115,8 @@ request is provably safe to serve elsewhere.
 
 ## Proof obligations (tests)
 - rebind_safe truth table: each condition alone false → False; all true → True.
+- Account-scoped input items and missing or mismatched prefix fingerprints →
+  False.
 - Hard-key + exhausted preferred + rebind_safe payload, no live session →
   fallback selection succeeds (200) and durable row rebinds.
 - Same but live stale session → one failed request, then rebind on next (S6).
@@ -123,6 +127,10 @@ request is provably safe to serve elsewhere.
 - Non-bridge callers (websocket, retry, compact, model-transition): selection
   behavior byte-identical to today (policy param defaulted).
 - Active preferred account → selected as before (no behavior change).
+- Preferred WebSocket-open failure followed by fallback → empty affinity and
+  no stale affinity headers.
+- Crash after account-change claim → the next full resend still verifies the
+  preserved prefix proof.
 - Concurrent double full-resend on same hard key → both complete, one canonical.
 
 ## Rollback

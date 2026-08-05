@@ -23,3 +23,11 @@
 - Balancer integration failures remain outside this change:
   `test_load_balancer_reactivates_after_secondary_reset` and
   `test_legacy_rate_limited_row_recovers_after_floor_elapses`.
+
+## 4. Adversarial review remediation
+
+- [x] 4.1 Require strict account-neutral replay validation and cover account-scoped input types.
+- [x] 4.2 Require the stored input-prefix count and fingerprint to match.
+- [x] 4.3 Unanchor rebind-safe account switches after refresh or WebSocket-open failures.
+- [x] 4.4 Preserve durable replay proof across account-change claims and post-claim failures.
+- [x] 4.5 Rerun affected unit, integration, lint, format, and diff checks.

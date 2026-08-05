@@ -4,9 +4,9 @@ An HTTP bridge can keep a hard locality pin to an account that is exhausted whil
 
 ## What Changes
 
-- Define a fail-closed HTTP-bridge-only `rebind_safe` predicate for full resends with no upstream continuity, file references, or turn-state header.
+- Define a fail-closed HTTP-bridge-only `rebind_safe` predicate that requires strict account-neutral validation and an exact match against the existing durable input-prefix proof.
 - Allow one fresh account selection after a non-capacity preferred-account selection failure when the predicate is true.
-- Open the fallback bridge without stale downstream affinity headers and let the existing durable claim transaction rebind the canonical row and clear old aliases.
+- Open every non-preferred fallback bridge without stale downstream affinity headers and let the durable claim transaction rebind the canonical row, clear old aliases, and retain the replay proof until completion.
 - Keep previous-response, file-owned, WebSocket, retry, compact, prompt-cache, model-transition, and configured single-account behavior unchanged.
 
 ## Capabilities
