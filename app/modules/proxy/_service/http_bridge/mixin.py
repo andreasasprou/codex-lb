@@ -1757,6 +1757,31 @@ class _HTTPBridgeMixin(
         unanchored_fallback = False
         rebind_fallback_attempted = False
         selected_account_lease: AccountLease | None = None
+
+        def activate_unanchored_fallback() -> None:
+            nonlocal affinity
+            nonlocal fallback_on_preferred_account_unavailable
+            nonlocal preferred_candidate_id
+            nonlocal selection_affinity
+            nonlocal selection_is_continuity_owner
+            nonlocal unanchored_fallback
+
+            unanchored_fallback = True
+            preferred_candidate_id = None
+            fallback_on_preferred_account_unavailable = True
+            selection_affinity = _AffinityPolicy()
+            selection_is_continuity_owner = False
+            affinity = _AffinityPolicy()
+
+        def exclude_account_for_fallback(account_id: str) -> None:
+            nonlocal preferred_candidate_id
+
+            excluded_account_ids.add(account_id)
+            if rebind_safe:
+                activate_unanchored_fallback()
+            else:
+                preferred_candidate_id = None
+
         while True:
             select_kwargs = {
                 "request_id": request_state.request_log_id or request_state.request_id,
@@ -1789,13 +1814,8 @@ class _HTTPBridgeMixin(
                 is_local_account_cap = _is_local_account_cap_code(selection.error_code)
                 if preferred_selection_only and not rebind_fallback_attempted and not is_local_account_cap:
                     rebind_fallback_attempted = True
-                    unanchored_fallback = True
                     excluded_account_ids.add(preferred_account_id)
-                    preferred_candidate_id = None
-                    fallback_on_preferred_account_unavailable = True
-                    selection_affinity = _AffinityPolicy()
-                    selection_is_continuity_owner = False
-                    affinity = _AffinityPolicy()
+                    activate_unanchored_fallback()
                     continue
                 if (
                     require_preferred_account
@@ -1814,6 +1834,8 @@ class _HTTPBridgeMixin(
                         error_type=error_type,
                     ),
                 )
+            if rebind_safe and preferred_account_id is not None and account.id != preferred_account_id:
+                activate_unanchored_fallback()
             if require_preferred_account and preferred_account_id is not None and account.id != preferred_account_id:
                 await self._load_balancer.release_account_lease(selected_account_lease)
                 selected_account_lease = None
@@ -1889,8 +1911,7 @@ class _HTTPBridgeMixin(
                         await self._load_balancer.release_account_lease(selected_account_lease)
                         selected_account_lease = None
                         raise
-                    excluded_account_ids.add(account.id)
-                    preferred_candidate_id = None
+                    exclude_account_for_fallback(account.id)
                     await self._load_balancer.release_account_lease(selected_account_lease)
                     selected_account_lease = None
                     continue
@@ -1901,8 +1922,7 @@ class _HTTPBridgeMixin(
                         await self._load_balancer.release_account_lease(selected_account_lease)
                         selected_account_lease = None
                         raise
-                    excluded_account_ids.add(account.id)
-                    preferred_candidate_id = None
+                    exclude_account_for_fallback(account.id)
                     await self._load_balancer.release_account_lease(selected_account_lease)
                     selected_account_lease = None
                     continue
@@ -1926,8 +1946,7 @@ class _HTTPBridgeMixin(
                                 error_type="server_error",
                             ),
                         ) from exc
-                    excluded_account_ids.add(account.id)
-                    preferred_candidate_id = None
+                    exclude_account_for_fallback(account.id)
                     await self._load_balancer.release_account_lease(selected_account_lease)
                     selected_account_lease = None
                     continue
@@ -1965,8 +1984,7 @@ class _HTTPBridgeMixin(
                                 error_type="server_error",
                             ),
                         ) from exc
-                    excluded_account_ids.add(account.id)
-                    preferred_candidate_id = None
+                    exclude_account_for_fallback(account.id)
                     await self._load_balancer.release_account_lease(selected_account_lease)
                     selected_account_lease = None
                     continue

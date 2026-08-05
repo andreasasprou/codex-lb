@@ -7,6 +7,7 @@ import pytest
 from app.core.openai.requests import ResponsesRequest
 from app.core.types import JsonValue
 from app.modules.proxy._service.http_bridge.streaming import _http_bridge_request_rebind_safe
+from app.modules.proxy._service.response_create import _fingerprint_input_items
 from app.modules.proxy.continuity import (
     is_http_bridge_account_neutral_replay,
     make_http_bridge_account_neutral_replay_key,
@@ -35,7 +36,11 @@ def test_http_bridge_request_rebind_safe_truth_table() -> None:
     ]
     payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "answer", "input": base_input})
     request_state = SimpleNamespace(previous_response_id=None, file_required_preferred_account=False)
-    durable_lookup = SimpleNamespace(latest_input_item_count=1)
+    stored_fingerprint = _fingerprint_input_items(base_input[:1])
+    durable_lookup = SimpleNamespace(
+        latest_input_item_count=1,
+        latest_input_full_fingerprint=stored_fingerprint,
+    )
 
     assert _http_bridge_request_rebind_safe(payload, {}, request_state, durable_lookup) is True
 
@@ -72,7 +77,12 @@ def test_http_bridge_request_rebind_safe_truth_table() -> None:
             request_state,
             durable_lookup,
         ),
-        "trimmed_input": (payload, {}, request_state, SimpleNamespace(latest_input_item_count=3)),
+        "trimmed_input": (
+            payload,
+            {},
+            request_state,
+            SimpleNamespace(latest_input_item_count=3, latest_input_full_fingerprint=stored_fingerprint),
+        ),
         "causal_closure": (
             payload.model_copy(
                 update={
@@ -86,13 +96,46 @@ def test_http_bridge_request_rebind_safe_truth_table() -> None:
             request_state,
             durable_lookup,
         ),
+        "item_reference": (
+            payload.model_copy(
+                update={"input": [*base_input, {"type": "item_reference", "id": "item_account_scoped"}]}
+            ),
+            {},
+            request_state,
+            durable_lookup,
+        ),
+        "computer_call": (
+            payload.model_copy(
+                update={"input": [*base_input, {"type": "computer_call", "call_id": "call_account_scoped"}]}
+            ),
+            {},
+            request_state,
+            durable_lookup,
+        ),
         "file_owner_pin": (
             payload,
             {},
             SimpleNamespace(previous_response_id=None, file_required_preferred_account=True),
             durable_lookup,
         ),
-        "missing_durable_count": (payload, {}, request_state, SimpleNamespace(latest_input_item_count=None)),
+        "fingerprint_mismatch": (
+            payload,
+            {},
+            request_state,
+            SimpleNamespace(latest_input_item_count=1, latest_input_full_fingerprint="0" * 64),
+        ),
+        "missing_fingerprint": (
+            payload,
+            {},
+            request_state,
+            SimpleNamespace(latest_input_item_count=1, latest_input_full_fingerprint=None),
+        ),
+        "missing_durable_count": (
+            payload,
+            {},
+            request_state,
+            SimpleNamespace(latest_input_item_count=None, latest_input_full_fingerprint=stored_fingerprint),
+        ),
     }
 
     for name, (case_payload, case_headers, case_state, case_lookup) in cases.items():

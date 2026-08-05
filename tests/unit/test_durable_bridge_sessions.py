@@ -12,6 +12,8 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.clients.proxy import ProxyResponseError
+from app.core.openai.requests import ResponsesRequest
+from app.core.types import JsonValue
 from app.core.utils.time import utcnow
 from app.db.models import (
     Base,
@@ -21,6 +23,8 @@ from app.db.models import (
     StickySession,
     StickySessionKind,
 )
+from app.modules.proxy import service as proxy_service
+from app.modules.proxy._service.http_bridge.streaming import _http_bridge_request_rebind_safe
 from app.modules.proxy.continuity import (
     HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_KEY_PREFIX,
     HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_KIND,
@@ -2037,6 +2041,88 @@ async def test_durable_bridge_rebind_commit_failure_preserves_old_claim_and_alia
     assert by_turn_state.session_id == claimed.session_id
     assert by_previous_response is not None
     assert by_previous_response.session_id == claimed.session_id
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_post_claim_crash_preserves_proof_for_second_rebind(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    input_items: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first turn"}],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "first answer"}],
+        },
+    ]
+    stored_fingerprint = proxy_service._fingerprint_input_items(input_items[:1])
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-post-claim-crash",
+        api_key_id=None,
+        instance_id="instance-a",
+        lease_ttl_seconds=60.0,
+        account_id="acc-old",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_old",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_old",
+        lease_ttl_seconds=60.0,
+        input_item_count=1,
+        input_full_fingerprint=stored_fingerprint,
+    )
+    await coordinator.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=True,
+    )
+
+    first_rebind = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-post-claim-crash",
+        api_key_id=None,
+        instance_id="instance-b",
+        lease_ttl_seconds=60.0,
+        account_id="acc-new",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+
+    # Simulate a process failure after the claim commit by performing no
+    # dispatch or completed-response registration before the next lookup.
+    durable_lookup = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-post-claim-crash",
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "answer", "input": input_items})
+    request_state = SimpleNamespace(previous_response_id=None, file_required_preferred_account=False)
+
+    assert first_rebind.account_id == "acc-new"
+    assert durable_lookup is not None
+    assert durable_lookup.latest_input_item_count == 1
+    assert durable_lookup.latest_input_full_fingerprint == stored_fingerprint
+    assert _http_bridge_request_rebind_safe(payload, {}, request_state, durable_lookup) is True
 
 
 @pytest.mark.asyncio

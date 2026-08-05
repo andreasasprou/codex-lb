@@ -272,8 +272,9 @@ class DurableBridgeRepository:
                 if account_changed:
                     existing.latest_turn_state = latest_turn_state
                     existing.latest_response_id = latest_response_id
-                    existing.latest_input_item_count = None
-                    existing.latest_input_full_fingerprint = None
+                    # Keep the last completed input-prefix proof until a later
+                    # completed response replaces it. A crash after this claim
+                    # must not make the same full resend unrebindable.
                 elif owner_changed:
                     if latest_turn_state is not None:
                         existing.latest_turn_state = latest_turn_state

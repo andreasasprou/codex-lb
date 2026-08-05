@@ -234,18 +234,24 @@ def _http_bridge_request_rebind_safe(
 ) -> bool:
     """Return true only when a full bridge resend has no account-owned state."""
 
-    stored_count = durable_lookup.latest_input_item_count if durable_lookup is not None else None
+    if durable_lookup is None or durable_lookup.latest_input_item_count is None:
+        return False
+    stored_count = durable_lookup.latest_input_item_count
     input_items = payload.input
     if (
-        stored_count is None
-        or request_state.previous_response_id is not None
+        request_state.previous_response_id is not None
         or payload.conversation is not None
         or request_state.file_required_preferred_account
         or any(header_name.lower() == "x-codex-turn-state" for header_name in headers)
         or not isinstance(input_items, list)
         or extract_input_file_ids(input_items)
         or not _http_bridge_payload_looks_like_full_resend(payload)
-        or len(input_items) < stored_count
+        or not _http_bridge_payload_is_account_neutral_fresh_replay(payload)
+        or not _input_prefix_matches_stored_context(
+            input_items,
+            stored_count=stored_count,
+            stored_fingerprint=durable_lookup.latest_input_full_fingerprint,
+        )
         or not input_items_have_causal_closure(input_items)
     ):
         return False
