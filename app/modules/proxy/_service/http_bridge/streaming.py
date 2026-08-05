@@ -1727,6 +1727,14 @@ class _HTTPBridgeStreamingMixin:
             and effective_payload.previous_response_id is None
             and session.last_completed_response_id is not None
             and (session_anchor_trimmable or recovery_session_can_anchor)
+            # A session anchor that already stalled a request pre-`response.created`
+            # is stale (dead upstream connection); reinjecting it loops 45s stalls
+            # (22 in 30 min, prod 2026-08-05). Same suppression as the durable path.
+            and not _is_suspect_durable_anchor(
+                self._http_bridge_suspect_durable_anchors,
+                session.last_completed_response_id,
+                _service_time().monotonic(),
+            )
         ):
             fresh_upstream_request_text = text_data
             effective_payload = effective_payload.model_copy(

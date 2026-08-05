@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import logging
@@ -19486,6 +19487,8 @@ async def _run_suspect_anchor_stream(
     service: Any,
     *,
     full_resend: bool = True,
+    session_last_completed: str | None = None,
+    durable_anchor: bool = True,
 ) -> list[proxy_service.ResponsesRequest]:
     input_items: list[dict[str, Any]] = [
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "one"}]},
@@ -19529,6 +19532,9 @@ async def _run_suspect_anchor_stream(
         return request_state, '{"type":"response.create"}'
 
     session = _make_bridge_session(key_value="sess-suspect-anchor")
+    if session_last_completed is not None:
+        session.codex_session = True
+        session.last_completed_response_id = session_last_completed
 
     async def fake_get_or_create_http_bridge_session(*args: object, **kwargs: object):
         del args, kwargs
@@ -19553,10 +19559,13 @@ async def _run_suspect_anchor_stream(
     )
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(proxy_service, "_input_prefix_matches_stored_context", lambda *args, **kwargs: True)
+    durable_lookup = _suspect_anchor_durable_lookup()
+    if not durable_anchor:
+        durable_lookup = dataclasses.replace(durable_lookup, latest_response_id=None)
     monkeypatch.setattr(
         service._durable_bridge,
         "lookup_request_targets",
-        AsyncMock(return_value=_suspect_anchor_durable_lookup()),
+        AsyncMock(return_value=durable_lookup),
     )
     monkeypatch.setattr(service, "_http_bridge_can_forward_to_active_owner", AsyncMock(return_value=False))
     monkeypatch.setattr(service, "_prepare_http_bridge_request", fake_prepare)
@@ -19600,5 +19609,41 @@ async def test_stream_via_http_bridge_skips_suspect_durable_anchor_on_short_foll
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     service._http_bridge_suspect_durable_anchors["resp_stale_anchor"] = time.monotonic() + 900.0
     prepared_payloads = await _run_suspect_anchor_stream(monkeypatch, service, full_resend=False)
+    assert prepared_payloads
+    assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_injects_session_anchor_when_not_suspect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    prepared_payloads = await _run_suspect_anchor_stream(
+        monkeypatch,
+        service,
+        full_resend=False,
+        session_last_completed="resp_session_anchor",
+        durable_anchor=False,
+    )
+    assert prepared_payloads
+    assert prepared_payloads[-1].previous_response_id == "resp_session_anchor"
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_skips_suspect_session_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Prod 2026-08-05: after reattach, a stale session anchor was reinjected on
+    # every retry (11x per anchor), each stalling 45s pre-response.created. The
+    # suspect map must suppress the session-anchor path like the durable path.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    service._http_bridge_suspect_durable_anchors["resp_session_anchor"] = time.monotonic() + 900.0
+    prepared_payloads = await _run_suspect_anchor_stream(
+        monkeypatch,
+        service,
+        full_resend=False,
+        session_last_completed="resp_session_anchor",
+        durable_anchor=False,
+    )
     assert prepared_payloads
     assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
