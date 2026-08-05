@@ -239,6 +239,53 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
     return all(not call_ids for call_ids in unsettled_call_ids_by_type.values())
 
 
+def input_items_have_causal_closure(
+    input_items: list[JsonValue],
+    *,
+    output_type_to_call_type: Mapping[str, str] | None = None,
+    require_message: bool = True,
+    reject_non_mapping: bool = True,
+) -> bool:
+    """Check that represented call outputs refer to earlier calls.
+
+    The default bridge mode recognizes every ``*_call_output`` family. The
+    WebSocket validator passes its historical three-family mapping so its
+    accepted input set remains unchanged.
+    """
+
+    seen_call_ids_by_type: dict[str, set[str]] = {}
+    message_seen = False
+    for item in input_items:
+        if not isinstance(item, dict):
+            if reject_non_mapping:
+                return False
+            continue
+        item_type = item.get("type")
+        if item_type in (None, "message"):
+            message_seen = True
+        call_id = item.get("call_id")
+        normalized_call_id = call_id if isinstance(call_id, str) and call_id else None
+        if output_type_to_call_type is None:
+            call_type = (
+                item_type.removesuffix("_call") if isinstance(item_type, str) and item_type.endswith("_call") else None
+            )
+            output_call_type = (
+                item_type.removesuffix("_call_output")
+                if isinstance(item_type, str) and item_type.endswith("_call_output")
+                else None
+            )
+        else:
+            call_type = item_type if item_type in output_type_to_call_type.values() else None
+            output_call_type = output_type_to_call_type.get(item_type) if isinstance(item_type, str) else None
+        if call_type is not None and normalized_call_id is not None:
+            seen_call_ids_by_type.setdefault(call_type, set()).add(normalized_call_id)
+        if output_call_type is not None and (
+            normalized_call_id is None or normalized_call_id not in seen_call_ids_by_type.get(output_call_type, set())
+        ):
+            return False
+    return message_seen or not require_message
+
+
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:
     if value is None:
         return True

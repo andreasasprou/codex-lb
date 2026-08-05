@@ -44,6 +44,7 @@ from app.core.metrics.prometheus import (
 )
 from app.core.openai.requests import (
     ResponsesRequest,
+    extract_input_file_ids,
 )
 from app.core.types import JsonValue
 from app.core.utils.request_id import ensure_request_id, ensure_request_scope_id
@@ -209,6 +210,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
 )
 from app.modules.proxy.replay_safety import (
+    input_items_have_causal_closure,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
@@ -222,6 +224,32 @@ _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
 
 def _http_bridge_payload_is_account_neutral_fresh_replay(payload: ResponsesRequest) -> bool:
     return responses_payload_is_account_neutral_fresh_replay(payload.to_payload())
+
+
+def _http_bridge_request_rebind_safe(
+    payload: ResponsesRequest,
+    headers: Mapping[str, str],
+    request_state: _WebSocketRequestState,
+    durable_lookup: DurableBridgeLookup | None,
+) -> bool:
+    """Return true only when a full bridge resend has no account-owned state."""
+
+    stored_count = durable_lookup.latest_input_item_count if durable_lookup is not None else None
+    input_items = payload.input
+    if (
+        stored_count is None
+        or request_state.previous_response_id is not None
+        or payload.conversation is not None
+        or request_state.file_required_preferred_account
+        or any(header_name.lower() == "x-codex-turn-state" for header_name in headers)
+        or not isinstance(input_items, list)
+        or extract_input_file_ids(input_items)
+        or not _http_bridge_payload_looks_like_full_resend(payload)
+        or len(input_items) < stored_count
+        or not input_items_have_causal_closure(input_items)
+    ):
+        return False
+    return True
 
 
 def _proxy_error_code_message(exc: ProxyResponseError) -> tuple[str | None, str | None]:
@@ -1118,6 +1146,8 @@ class _HTTPBridgeStreamingMixin:
             and request_state.preferred_account_id == continuity_preferred_account_id
         )
         file_required_preferred_account = rewritten_file_account_id is not None
+        request_state.file_required_preferred_account = file_required_preferred_account
+        rebind_safe = _http_bridge_request_rebind_safe(payload, headers, request_state, durable_lookup)
         if proxy_injected_previous_response_id:
             request_state.proxy_injected_previous_response_id = True
             request_state.fresh_upstream_request_text = fresh_upstream_request_text or text_data
@@ -1293,6 +1323,7 @@ class _HTTPBridgeStreamingMixin:
                     preferred_account_id=request_state.preferred_account_id,
                     preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
                     fallback_on_preferred_account_unavailable=not file_required_preferred_account,
+                    rebind_safe=rebind_safe,
                     request_usage_budget=request_state.request_usage_budget,
                     request_deadline=request_deadline,
                     session_header_fallback_key=session_header_fallback_key,

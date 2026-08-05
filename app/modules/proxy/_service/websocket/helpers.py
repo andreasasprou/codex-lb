@@ -338,6 +338,7 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
+from app.modules.proxy.replay_safety import input_items_have_causal_closure
 
 
 def _facade() -> Any:
@@ -445,23 +446,12 @@ _WEBSOCKET_TOOL_CALL_ITEM_TYPES = frozenset(_WEBSOCKET_TOOL_CALL_ITEM_TYPES_BY_O
 
 
 def _websocket_input_items_are_self_contained_fresh_replay(input_items: list[JsonValue]) -> bool:
-    seen_call_ids_by_type: dict[str, set[str]] = {item_type: set() for item_type in _WEBSOCKET_TOOL_CALL_ITEM_TYPES}
-    for item in input_items:
-        if not isinstance(item, dict):
-            continue
-        item_type = _websocket_input_item_type(item)
-        call_id_value = item.get("call_id")
-        call_id = call_id_value if isinstance(call_id_value, str) and call_id_value else None
-        if item_type in _WEBSOCKET_TOOL_CALL_ITEM_TYPES:
-            if call_id is not None:
-                seen_call_ids_by_type[item_type].add(call_id)
-            continue
-        call_item_type = _WEBSOCKET_TOOL_CALL_ITEM_TYPES_BY_OUTPUT_TYPE.get(item_type or "")
-        if call_item_type is None:
-            continue
-        if call_id is None or call_id not in seen_call_ids_by_type[call_item_type]:
-            return False
-    return True
+    return input_items_have_causal_closure(
+        input_items,
+        output_type_to_call_type=_WEBSOCKET_TOOL_CALL_ITEM_TYPES_BY_OUTPUT_TYPE,
+        require_message=False,
+        reject_non_mapping=False,
+    )
 
 
 def _websocket_client_previous_response_full_resend_is_retry_safe(

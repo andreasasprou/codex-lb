@@ -356,6 +356,7 @@ class _HTTPBridgeMixin(
         preferred_account_id: str | None = None,
         preferred_account_has_continuity_provenance: bool = False,
         fallback_on_preferred_account_unavailable: bool = True,
+        rebind_safe: bool = False,
         request_usage_budget: ApiKeyRequestUsageBudget | None = None,
         request_deadline: float | None = None,
         session_header_fallback_key: "_HTTPBridgeSessionKey | None" = None,
@@ -388,6 +389,7 @@ class _HTTPBridgeMixin(
         preferred_account_id: str | None = None,
         preferred_account_has_continuity_provenance: bool = False,
         fallback_on_preferred_account_unavailable: bool = True,
+        rebind_safe: bool = False,
         request_usage_budget: ApiKeyRequestUsageBudget | None = None,
         request_deadline: float | None = None,
         session_header_fallback_key: "_HTTPBridgeSessionKey | None" = None,
@@ -419,6 +421,7 @@ class _HTTPBridgeMixin(
         preferred_account_id: str | None = None,
         preferred_account_has_continuity_provenance: bool = False,
         fallback_on_preferred_account_unavailable: bool = True,
+        rebind_safe: bool = False,
         request_usage_budget: ApiKeyRequestUsageBudget | None = None,
         request_deadline: float | None = None,
         session_header_fallback_key: "_HTTPBridgeSessionKey | None" = None,
@@ -530,9 +533,8 @@ class _HTTPBridgeMixin(
             }
             require_preferred_account = preferred_account_id is not None and (
                 previous_response_id is not None
-                or preferred_account_has_continuity_provenance
-                or key.strength == "hard"
-                or not fallback_on_preferred_account_unavailable
+                or (preferred_account_has_continuity_provenance and not rebind_safe)
+                or ((key.strength == "hard" or not fallback_on_preferred_account_unavailable) and not rebind_safe)
             )
             async with self._http_bridge_lock:
                 if (
@@ -1476,6 +1478,7 @@ class _HTTPBridgeMixin(
                     "request_stage": request_stage,
                     "preferred_account_id": preferred_account_id,
                     "require_preferred_account": require_preferred_account,
+                    "rebind_safe": rebind_safe,
                     "preferred_account_is_continuity_owner": preferred_account_is_continuity_owner,
                     "fallback_on_preferred_account_unavailable": (
                         fallback_on_preferred_account_unavailable and not require_preferred_account
@@ -1499,6 +1502,7 @@ class _HTTPBridgeMixin(
                         "request_deadline",
                         "exclude_account_ids",
                         "preferred_account_is_continuity_owner",
+                        "rebind_safe",
                     ):
                         if optional_kwarg not in create_signature.parameters:
                             create_kwargs.pop(optional_kwarg, None)
@@ -1717,6 +1721,7 @@ class _HTTPBridgeMixin(
         require_preferred_account: bool = False,
         preferred_account_is_continuity_owner: bool = False,
         fallback_on_preferred_account_unavailable: bool = True,
+        rebind_safe: bool = False,
         request_usage_budget: ApiKeyRequestUsageBudget | None = None,
         request_deadline: float | None = None,
         exclude_account_ids: Collection[str] | None = None,
@@ -1742,8 +1747,15 @@ class _HTTPBridgeMixin(
         excluded_account_ids = set(exclude_account_ids or ())
         if require_preferred_account:
             fallback_on_preferred_account_unavailable = False
+        preferred_selection_only = rebind_safe and preferred_account_id is not None
+        if preferred_selection_only:
+            fallback_on_preferred_account_unavailable = False
         retry_same_account_once = preferred_account_id is not None
         preferred_candidate_id = preferred_account_id
+        selection_affinity = affinity
+        selection_is_continuity_owner = preferred_account_is_continuity_owner
+        unanchored_fallback = False
+        rebind_fallback_attempted = False
         selected_account_lease: AccountLease | None = None
         while True:
             select_kwargs = {
@@ -1751,7 +1763,7 @@ class _HTTPBridgeMixin(
                 "kind": "http_bridge",
                 "request_stage": request_stage,
                 "api_key": api_key,
-                "affinity_policy": affinity,
+                "affinity_policy": selection_affinity,
                 "prefer_earlier_reset_accounts": settings.prefer_earlier_reset_accounts,
                 "prefer_earlier_reset_window": _prefer_earlier_reset_window(settings),
                 "routing_strategy": _routing_strategy(settings),
@@ -1759,7 +1771,7 @@ class _HTTPBridgeMixin(
                 "service_tier": request_service_tier,
                 "exclude_account_ids": excluded_account_ids,
                 "preferred_account_id": preferred_candidate_id,
-                "preferred_account_is_continuity_owner": preferred_account_is_continuity_owner,
+                "preferred_account_is_continuity_owner": selection_is_continuity_owner,
                 "lease_kind": "stream",
                 "estimated_lease_tokens": _estimated_lease_tokens_from_request_usage_budget(request_usage_budget),
                 "fallback_on_preferred_account_unavailable": fallback_on_preferred_account_unavailable,
@@ -1775,6 +1787,16 @@ class _HTTPBridgeMixin(
                     selected_account_id=None,
                 )
                 is_local_account_cap = _is_local_account_cap_code(selection.error_code)
+                if preferred_selection_only and not rebind_fallback_attempted and not is_local_account_cap:
+                    rebind_fallback_attempted = True
+                    unanchored_fallback = True
+                    excluded_account_ids.add(preferred_account_id)
+                    preferred_candidate_id = None
+                    fallback_on_preferred_account_unavailable = True
+                    selection_affinity = _AffinityPolicy()
+                    selection_is_continuity_owner = False
+                    affinity = _AffinityPolicy()
+                    continue
                 if (
                     require_preferred_account
                     and preferred_account_id is not None
@@ -1816,7 +1838,8 @@ class _HTTPBridgeMixin(
                     timeout_seconds=_remaining_budget_seconds(deadline),
                 )
                 connect_headers = _websocket_safe_headers_with_turn_state(
-                    headers, _sticky_key_from_turn_state_header(headers)
+                    without_http_bridge_session_affinity_headers(headers) if unanchored_fallback else headers,
+                    None if unanchored_fallback else _sticky_key_from_turn_state_header(headers),
                 )
                 upstream = await _call_with_supported_optional_kwargs(
                     self._open_upstream_websocket_with_budget,
@@ -1842,7 +1865,8 @@ class _HTTPBridgeMixin(
                         timeout_seconds=_remaining_budget_seconds(deadline),
                     )
                     connect_headers = _websocket_safe_headers_with_turn_state(
-                        headers, _sticky_key_from_turn_state_header(headers)
+                        without_http_bridge_session_affinity_headers(headers) if unanchored_fallback else headers,
+                        None if unanchored_fallback else _sticky_key_from_turn_state_header(headers),
                     )
                     upstream = await self._open_upstream_websocket_with_budget(
                         account,
