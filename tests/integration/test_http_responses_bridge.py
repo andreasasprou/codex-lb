@@ -7398,6 +7398,498 @@ async def test_v1_responses_http_bridge_replays_full_resend_once_then_stays_on_n
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_http_bridge_rebinds_fresh_hard_key_full_resend_after_owner_exhaustion(
+    async_client, app_instance, monkeypatch
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_soft_pin_owner",
+        "http-bridge-soft-pin-owner@example.com",
+    )
+    fallback_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_soft_pin_fallback",
+        "http-bridge-soft-pin-fallback@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    fallback_account = await _get_account(fallback_account_id)
+    owner_chatgpt_account_id = cast(str, owner_account.chatgpt_account_id)
+    fallback_chatgpt_account_id = cast(str, fallback_account.chatgpt_account_id)
+    owner_upstream = _ClosingBridgeUpstreamWebSocket("resp_soft_pin_owner")
+    fallback_upstream = _FakeBridgeUpstreamWebSocket("resp_soft_pin_fallback")
+    selection_calls: list[dict[str, object]] = []
+    connect_headers_by_account: dict[str, dict[str, str]] = {}
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline
+        selection_calls.append(dict(kwargs))
+        preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
+        excluded_account_ids = cast(set[str], kwargs.get("exclude_account_ids") or set())
+        if preferred_account_id is None and owner_account.id not in excluded_account_ids:
+            return AccountSelection(account=owner_account, error_message=None, error_code=None)
+        if preferred_account_id == owner_account.id:
+            assert kwargs.get("fallback_on_preferred_account_unavailable") is False
+            return AccountSelection(
+                account=None,
+                error_message="Preferred account is exhausted",
+                error_code="quota_exhausted",
+            )
+        assert preferred_account_id is None
+        assert owner_account.id in excluded_account_ids
+        return AccountSelection(account=fallback_account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del access_token, base_url, session
+        connect_headers_by_account[account_id_header] = dict(headers)
+        if account_id_header == owner_chatgpt_account_id:
+            return owner_upstream
+        assert account_id_header == fallback_chatgpt_account_id
+        return fallback_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_header = "soft-pin-session"
+    historical_input = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    first = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": historical_input,
+            },
+            headers={"session_id": session_header},
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert first.status_code == 200, first.text
+
+    retained_prior_output = {
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "first answer"}],
+    }
+    full_resend = [
+        *historical_input,
+        retained_prior_output,
+        {"role": "user", "content": [{"type": "input_text", "text": "second question"}]},
+    ]
+    second = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": full_resend,
+            },
+            headers={"session_id": session_header},
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["output"][0]["content"][0]["text"] == "OK"
+    assert len(selection_calls) == 3
+    assert selection_calls[0]["preferred_account_id"] is None
+    assert selection_calls[1]["preferred_account_id"] == owner_account.id
+    assert selection_calls[2]["preferred_account_id"] is None
+    assert selection_calls[2]["exclude_account_ids"] == {owner_account.id}
+    fallback_headers = {
+        key.lower(): value for key, value in connect_headers_by_account[fallback_chatgpt_account_id].items()
+    }
+    assert "session_id" not in fallback_headers
+    assert "x-codex-session-id" not in fallback_headers
+    assert "x-codex-turn-state" not in fallback_headers
+    assert json.loads(fallback_upstream.sent_text[0])["input"] == full_resend
+
+    service = get_proxy_service_for_app(app_instance)
+    rebound = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value=session_header,
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    old_response_owner = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="request",
+        session_key_value="soft-pin-follow-up",
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id=first.json()["id"],
+    )
+    assert rebound is not None
+    assert rebound.account_id == fallback_account.id
+    assert old_response_owner is None
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_live_stale_session_fails_once_before_full_resend_rebind(
+    async_client, app_instance, monkeypatch
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_soft_pin_live_owner",
+        "http-bridge-soft-pin-live-owner@example.com",
+    )
+    fallback_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_soft_pin_live_fallback",
+        "http-bridge-soft-pin-live-fallback@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    fallback_account = await _get_account(fallback_account_id)
+    owner_chatgpt_account_id = cast(str, owner_account.chatgpt_account_id)
+    fallback_chatgpt_account_id = cast(str, fallback_account.chatgpt_account_id)
+    owner_upstream = _FakeBridgeUpstreamWebSocket("resp_soft_pin_live_owner")
+    fallback_upstream = _FakeBridgeUpstreamWebSocket("resp_soft_pin_live_fallback")
+    selection_calls: list[dict[str, object]] = []
+    connect_headers_by_account: dict[str, dict[str, str]] = {}
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline
+        selection_calls.append(dict(kwargs))
+        preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
+        excluded_account_ids = cast(set[str], kwargs.get("exclude_account_ids") or set())
+        if preferred_account_id is None and owner_account.id not in excluded_account_ids:
+            return AccountSelection(account=owner_account, error_message=None, error_code=None)
+        if preferred_account_id == owner_account.id:
+            return AccountSelection(
+                account=None,
+                error_message="Preferred account is exhausted",
+                error_code="quota_exhausted",
+            )
+        assert preferred_account_id is None
+        assert owner_account.id in excluded_account_ids
+        return AccountSelection(account=fallback_account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del access_token, base_url, session
+        connect_headers_by_account[account_id_header] = dict(headers)
+        if account_id_header == owner_chatgpt_account_id:
+            return owner_upstream
+        assert account_id_header == fallback_chatgpt_account_id
+        return fallback_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_header = "soft-pin-live-session"
+    historical_input = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    first = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": historical_input,
+            },
+            headers={"session_id": session_header},
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert first.status_code == 200, first.text
+
+    service = get_proxy_service_for_app(app_instance)
+    async with service._http_bridge_lock:
+        session = service._http_bridge_sessions[
+            proxy_module._HTTPBridgeSessionKey("session_header", session_header, None)
+        ]
+        await _replace_http_bridge_upstream_reader(
+            service,
+            session,
+            cast(proxy_module.UpstreamResponsesWebSocket, _PreviousResponseNotFoundUpstreamWebSocket()),
+        )
+
+    full_resend = [
+        *historical_input,
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "first answer"}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "second question"}]},
+    ]
+    stale = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": full_resend,
+            },
+            headers={"session_id": session_header},
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert stale.status_code == 502, stale.text
+    assert stale.json()["error"]["code"] == "bridge_previous_response_not_found"
+
+    rebound = await asyncio.wait_for(
+        async_client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": full_resend,
+            },
+            headers={"session_id": session_header},
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert rebound.status_code == 200, rebound.text
+    assert rebound.json()["output"][0]["content"][0]["text"] == "OK"
+    assert len(selection_calls) == 3
+    assert selection_calls[-2]["preferred_account_id"] == owner_account.id
+    assert selection_calls[-1]["preferred_account_id"] is None
+    assert selection_calls[-1]["exclude_account_ids"] == {owner_account.id}
+    assert json.loads(fallback_upstream.sent_text[0])["input"] == full_resend
+    assert fallback_chatgpt_account_id in connect_headers_by_account
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_concurrent_full_resends_rebind_one_canonical_row(
+    async_client, app_instance, monkeypatch
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_soft_pin_concurrent_owner",
+        "http-bridge-soft-pin-concurrent-owner@example.com",
+    )
+    fallback_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_soft_pin_concurrent_fallback",
+        "http-bridge-soft-pin-concurrent-fallback@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    fallback_account = await _get_account(fallback_account_id)
+    owner_chatgpt_account_id = cast(str, owner_account.chatgpt_account_id)
+    fallback_chatgpt_account_id = cast(str, fallback_account.chatgpt_account_id)
+    owner_upstream = _ClosingBridgeUpstreamWebSocket("resp_soft_pin_concurrent_owner")
+    fallback_upstreams: list[_FakeBridgeUpstreamWebSocket] = []
+    all_fallback_requests_sent = asyncio.Event()
+    release_fallback_responses = asyncio.Event()
+    fallback_selection_started = asyncio.Event()
+    release_fallback_selection = asyncio.Event()
+    total_fallback_sends = 0
+    selection_calls: list[dict[str, object]] = []
+
+    class ConcurrentFallbackUpstream(_FakeBridgeUpstreamWebSocket):
+        async def send_text(self, text: str) -> None:
+            nonlocal total_fallback_sends
+            self.sent_text.append(text)
+            total_fallback_sends += 1
+            if total_fallback_sends == 2:
+                all_fallback_requests_sent.set()
+            await release_fallback_responses.wait()
+            response_id = f"resp_soft_pin_concurrent_fallback_{total_fallback_sends}"
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": response_id,
+                                "object": "response",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "OK"}],
+                                    }
+                                ],
+                                "usage": {
+                                    "input_tokens": 24,
+                                    "output_tokens": 2,
+                                    "total_tokens": 26,
+                                    "input_tokens_details": {"cached_tokens": 20},
+                                    "output_tokens_details": {"reasoning_tokens": 0},
+                                },
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline
+        selection_calls.append(dict(kwargs))
+        preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
+        excluded_account_ids = cast(set[str], kwargs.get("exclude_account_ids") or set())
+        if preferred_account_id is None and owner_account.id not in excluded_account_ids:
+            return AccountSelection(account=owner_account, error_message=None, error_code=None)
+        if preferred_account_id == owner_account.id:
+            return AccountSelection(
+                account=None,
+                error_message="Preferred account is exhausted",
+                error_code="quota_exhausted",
+            )
+        assert preferred_account_id is None
+        assert owner_account.id in excluded_account_ids
+        fallback_selection_started.set()
+        await release_fallback_selection.wait()
+        return AccountSelection(account=fallback_account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, base_url, session
+        assert account_id_header in {owner_chatgpt_account_id, fallback_chatgpt_account_id}
+        if account_id_header == owner_chatgpt_account_id:
+            return owner_upstream
+        upstream = ConcurrentFallbackUpstream("resp_soft_pin_concurrent_fallback")
+        fallback_upstreams.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_header = "soft-pin-concurrent-session"
+    historical_input = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+        }
+    ]
+    first = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+        },
+        headers={"session_id": session_header},
+    )
+    assert first.status_code == 200, first.text
+
+    service = get_proxy_service_for_app(app_instance)
+    before = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value=session_header,
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert before is not None
+    canonical_session_id = before.session_id
+
+    full_resend = [
+        *historical_input,
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "first answer"}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "second question"}]},
+    ]
+    first_resend_task = asyncio.create_task(
+        async_client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.1", "instructions": "Return exactly OK.", "input": full_resend},
+            headers={"session_id": session_header},
+        )
+    )
+    second_resend_task = asyncio.create_task(
+        async_client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.1", "instructions": "Return exactly OK.", "input": full_resend},
+            headers={"session_id": session_header},
+        )
+    )
+    await asyncio.wait_for(fallback_selection_started.wait(), timeout=_TEST_SYNC_TIMEOUT_SECONDS)
+    release_fallback_selection.set()
+    await asyncio.wait_for(all_fallback_requests_sent.wait(), timeout=_TEST_SYNC_TIMEOUT_SECONDS)
+    release_fallback_responses.set()
+    first_resend, second_resend = await asyncio.wait_for(
+        asyncio.gather(first_resend_task, second_resend_task),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+
+    assert first_resend.status_code == 200, first_resend.text
+    assert second_resend.status_code == 200, second_resend.text
+    assert total_fallback_sends == 2
+    after = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value=session_header,
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert after is not None
+    assert after.session_id == canonical_session_id
+    assert after.account_id == fallback_account.id
+    assert len(selection_calls) >= 3
+
+
+@pytest.mark.asyncio
 async def test_backend_responses_http_bridge_real_selector_recovers_full_resend_without_degrading_pool(
     async_client, monkeypatch
 ):

@@ -1,18 +1,116 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.core.openai.requests import ResponsesRequest
 from app.core.types import JsonValue
+from app.modules.proxy._service.http_bridge.streaming import _http_bridge_request_rebind_safe
 from app.modules.proxy.continuity import (
     is_http_bridge_account_neutral_replay,
     make_http_bridge_account_neutral_replay_key,
 )
 from app.modules.proxy.replay_safety import (
+    input_items_have_causal_closure,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
+
+
+def test_http_bridge_request_rebind_safe_truth_table() -> None:
+    base_input: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "answer"}],
+        },
+    ]
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "answer", "input": base_input})
+    request_state = SimpleNamespace(previous_response_id=None, file_required_preferred_account=False)
+    durable_lookup = SimpleNamespace(latest_input_item_count=1)
+
+    assert _http_bridge_request_rebind_safe(payload, {}, request_state, durable_lookup) is True
+
+    cases = {
+        "previous_response_id": (
+            payload,
+            {},
+            SimpleNamespace(previous_response_id="resp_old", file_required_preferred_account=False),
+            durable_lookup,
+        ),
+        "conversation": (
+            payload.model_copy(update={"conversation": "conv_old"}),
+            {},
+            request_state,
+            durable_lookup,
+        ),
+        "turn_state_header": (payload, {"X-Codex-Turn-State": ""}, request_state, durable_lookup),
+        "file_id": (
+            payload.model_copy(
+                update={
+                    "input": [
+                        *base_input,
+                        {"type": "input_file", "file_id": "file_owner"},
+                    ]
+                }
+            ),
+            {},
+            request_state,
+            durable_lookup,
+        ),
+        "not_full_resend": (
+            payload.model_copy(update={"input": base_input[:1]}),
+            {},
+            request_state,
+            durable_lookup,
+        ),
+        "trimmed_input": (payload, {}, request_state, SimpleNamespace(latest_input_item_count=3)),
+        "causal_closure": (
+            payload.model_copy(
+                update={
+                    "input": [
+                        base_input[0],
+                        {"type": "function_call_output", "call_id": "missing", "output": "orphan"},
+                    ]
+                }
+            ),
+            {},
+            request_state,
+            durable_lookup,
+        ),
+        "file_owner_pin": (
+            payload,
+            {},
+            SimpleNamespace(previous_response_id=None, file_required_preferred_account=True),
+            durable_lookup,
+        ),
+        "missing_durable_count": (payload, {}, request_state, SimpleNamespace(latest_input_item_count=None)),
+    }
+
+    for name, (case_payload, case_headers, case_state, case_lookup) in cases.items():
+        assert _http_bridge_request_rebind_safe(case_payload, case_headers, case_state, case_lookup) is False, name
+
+
+def test_input_items_have_causal_closure_requires_message_and_matches_future_call_output() -> None:
+    assert (
+        input_items_have_causal_closure(
+            [
+                {"type": "message", "role": "user"},
+                {"type": "future_call", "call_id": "call-1"},
+                {"type": "future_call_output", "call_id": "call-1"},
+            ]
+        )
+        is True
+    )
+    assert input_items_have_causal_closure([{"type": "future_call_output", "call_id": "call-1"}]) is False
 
 
 @pytest.mark.parametrize(

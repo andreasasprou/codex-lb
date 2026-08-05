@@ -1937,6 +1937,109 @@ async def test_durable_bridge_takeover_with_account_change_clears_stale_aliases(
 
 
 @pytest.mark.asyncio
+async def test_durable_bridge_rebind_commit_failure_preserves_old_claim_and_aliases(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-rebind-rollback",
+        api_key_id=None,
+        instance_id="instance-a",
+        lease_ttl_seconds=60.0,
+        account_id="acc-old",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_old",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_turn_state(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        turn_state="http_turn_old",
+        lease_ttl_seconds=60.0,
+    )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_old",
+        lease_ttl_seconds=60.0,
+        input_item_count=4,
+        input_full_fingerprint="a" * 64,
+    )
+    await coordinator.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=True,
+    )
+
+    async with async_session_factory() as session:
+        repository = DurableBridgeRepository(session)
+
+        async def fail_replacement_commit() -> None:
+            raise RuntimeError("simulated crash between durable replacement write and commit")
+
+        monkeypatch.setattr(session, "commit", fail_replacement_commit)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await repository.claim_session(
+                session_key_kind="session_header",
+                session_key_value="sid-rebind-rollback",
+                api_key_scope="__anonymous__",
+                instance_id="instance-b",
+                lease_ttl_seconds=60.0,
+                account_id="acc-new",
+                model="gpt-5.4",
+                service_tier=None,
+                latest_turn_state=None,
+                latest_response_id=None,
+                allow_takeover=True,
+            )
+        await session.rollback()
+
+    by_canonical_key = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-rebind-rollback",
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    by_turn_state = await coordinator.lookup_request_targets(
+        session_key_kind="request",
+        session_key_value="request-after-rollback",
+        api_key_id=None,
+        turn_state="http_turn_old",
+        session_header=None,
+        previous_response_id=None,
+    )
+    by_previous_response = await coordinator.lookup_request_targets(
+        session_key_kind="request",
+        session_key_value="request-after-rollback",
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id="resp_old",
+    )
+
+    assert by_canonical_key is not None
+    assert by_canonical_key.account_id == "acc-old"
+    assert by_canonical_key.latest_turn_state == "http_turn_old"
+    assert by_canonical_key.latest_response_id == "resp_old"
+    assert by_canonical_key.latest_input_item_count == 4
+    assert by_turn_state is not None
+    assert by_turn_state.session_id == claimed.session_id
+    assert by_previous_response is not None
+    assert by_previous_response.session_id == claimed.session_id
+
+
+@pytest.mark.asyncio
 async def test_durable_bridge_lookup_active_lease_survives_request_lookup(
     coordinator: DurableBridgeSessionCoordinator,
 ) -> None:

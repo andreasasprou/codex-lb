@@ -5233,6 +5233,150 @@ async def test_create_http_bridge_session_filters_http_headers_for_upstream_webs
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selection_error_code",
+    ["quota_exhausted", "no_plan_support_for_model", "no_accounts", None],
+)
+async def test_create_http_bridge_session_rebinds_after_non_capacity_preferred_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    selection_error_code: str | None,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    owner = cast(Any, SimpleNamespace(id="acc-owner", status=AccountStatus.ACTIVE, plan_type="plus"))
+    fallback = cast(Any, SimpleNamespace(id="acc-fallback", status=AccountStatus.ACTIVE, plan_type="plus"))
+    selection_calls: list[dict[str, Any]] = []
+    connect_headers: list[dict[str, str]] = []
+
+    async def select_account(_deadline: float, **kwargs: Any) -> proxy_service.AccountSelection:
+        selection_calls.append(kwargs)
+        if len(selection_calls) == 1:
+            return proxy_service.AccountSelection(
+                account=None,
+                error_message="preferred account unavailable",
+                error_code=selection_error_code,
+            )
+        return proxy_service.AccountSelection(account=fallback, error_message=None)
+
+    async def open_upstream(_account: Any, headers: dict[str, str], **_: Any) -> Any:
+        connect_headers.append(dict(headers))
+        return SimpleNamespace(response_header=lambda _name: None, close=AsyncMock())
+
+    async def relay(_session: proxy_service._HTTPBridgeSession) -> None:
+        return None
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    prefer_earlier_reset_accounts=False,
+                    routing_strategy="usage_weighted",
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(service, "_select_account_with_budget_for_stream", select_account)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(side_effect=lambda account, **_: account))
+    monkeypatch.setattr(service, "_open_upstream_websocket_with_budget", open_upstream)
+    monkeypatch.setattr(service, "_relay_http_bridge_upstream_messages", relay)
+    service._load_balancer = cast(Any, SimpleNamespace(release_account_lease=AsyncMock()))
+
+    session = await service._create_http_bridge_session(
+        proxy_service._HTTPBridgeSessionKey("session_header", "sid-rebind", None),
+        headers={
+            "session_id": "sid-rebind",
+            "x-codex-session-id": "sid-rebind",
+            "x-codex-turn-state": "stale-turn-state",
+            "x-request-trace": "keep-me",
+        },
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-rebind",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        api_key=None,
+        request_model="gpt-5.4",
+        idle_ttl_seconds=120.0,
+        preferred_account_id=owner.id,
+        preferred_account_is_continuity_owner=True,
+        fallback_on_preferred_account_unavailable=True,
+        rebind_safe=True,
+    )
+
+    assert session.account is fallback
+    assert len(selection_calls) == 2
+    assert selection_calls[0]["preferred_account_id"] == owner.id
+    assert selection_calls[0]["fallback_on_preferred_account_unavailable"] is False
+    assert selection_calls[1]["preferred_account_id"] is None
+    assert selection_calls[1]["exclude_account_ids"] == {owner.id}
+    assert selection_calls[1]["affinity_policy"] == proxy_service._AffinityPolicy()
+    assert connect_headers
+    normalized_headers = {key.lower(): value for key, value in connect_headers[0].items()}
+    assert normalized_headers["x-request-trace"] == "keep-me"
+    assert (
+        not {
+            "session_id",
+            "x-codex-session-id",
+            "x-codex-turn-state",
+        }
+        & normalized_headers.keys()
+    )
+    if session.upstream_reader is not None:
+        await session.upstream_reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection_error_code", ["account_stream_cap", "account_response_create_cap"])
+async def test_create_http_bridge_session_keeps_capacity_wait_after_preferred_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    selection_error_code: str,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    selection_calls: list[dict[str, Any]] = []
+
+    async def select_account(_deadline: float, **kwargs: Any) -> proxy_service.AccountSelection:
+        selection_calls.append(kwargs)
+        return proxy_service.AccountSelection(
+            account=None,
+            error_message="account capacity is full",
+            error_code=selection_error_code,
+        )
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    prefer_earlier_reset_accounts=False,
+                    routing_strategy="usage_weighted",
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(service, "_select_account_with_budget_for_stream", select_account)
+    service._load_balancer = cast(Any, SimpleNamespace(release_account_lease=AsyncMock()))
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await service._create_http_bridge_session(
+            proxy_service._HTTPBridgeSessionKey("session_header", "sid-cap", None),
+            headers={},
+            affinity=proxy_service._AffinityPolicy(),
+            api_key=None,
+            request_model="gpt-5.4",
+            idle_ttl_seconds=120.0,
+            preferred_account_id="acc-owner",
+            fallback_on_preferred_account_unavailable=True,
+            rebind_safe=True,
+        )
+
+    assert exc_info.value.status_code == 429
+    assert len(selection_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_reconnect_http_bridge_session_filters_http_headers_for_upstream_websocket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16338,6 +16482,99 @@ async def test_get_or_create_http_bridge_session_hard_preferred_owner_blocks_sta
     assert create_call is not None
     assert create_call.kwargs["require_preferred_account"] is True
     assert create_call.kwargs["fallback_on_preferred_account_unavailable"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_http_bridge_session_softens_durable_provenance_for_rebind_safe_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("session_header", "sid-rebind-safe", None)
+    created_session = _make_bridge_session(key=key, key_value="sid-rebind-safe")
+    create_session = AsyncMock(return_value=created_session)
+
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_session)
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-a"))
+    monkeypatch.setattr(
+        proxy_service,
+        "_active_http_bridge_instance_ring",
+        AsyncMock(return_value=("instance-a", ("instance-a",))),
+    )
+
+    resolved = await service._get_or_create_http_bridge_session(
+        key,
+        headers={"x-codex-session-id": "sid-rebind-safe"},
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-rebind-safe",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        api_key=None,
+        request_model="gpt-5.4",
+        idle_ttl_seconds=120.0,
+        max_sessions=8,
+        request_stage="follow_up",
+        preferred_account_id="acc-owner",
+        preferred_account_has_continuity_provenance=True,
+        fallback_on_preferred_account_unavailable=True,
+        rebind_safe=True,
+    )
+
+    assert resolved is created_session
+    create_call = create_session.await_args
+    assert create_call is not None
+    assert create_call.kwargs["preferred_account_id"] == "acc-owner"
+    assert create_call.kwargs["require_preferred_account"] is False
+    assert create_call.kwargs["fallback_on_preferred_account_unavailable"] is True
+    assert create_call.kwargs["rebind_safe"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_http_bridge_session_keeps_hard_owner_for_unsafe_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("session_header", "sid-unsafe", None)
+    created_session = _make_bridge_session(key=key, key_value="sid-unsafe")
+    create_session = AsyncMock(return_value=created_session)
+
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_session)
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-a"))
+    monkeypatch.setattr(
+        proxy_service,
+        "_active_http_bridge_instance_ring",
+        AsyncMock(return_value=("instance-a", ("instance-a",))),
+    )
+
+    resolved = await service._get_or_create_http_bridge_session(
+        key,
+        headers={"x-codex-session-id": "sid-unsafe"},
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-unsafe",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        api_key=None,
+        request_model="gpt-5.4",
+        idle_ttl_seconds=120.0,
+        max_sessions=8,
+        request_stage="follow_up",
+        preferred_account_id="acc-owner",
+        preferred_account_has_continuity_provenance=True,
+        fallback_on_preferred_account_unavailable=True,
+        rebind_safe=False,
+    )
+
+    assert resolved is created_session
+    create_call = create_session.await_args
+    assert create_call is not None
+    assert create_call.kwargs["require_preferred_account"] is True
+    assert create_call.kwargs["fallback_on_preferred_account_unavailable"] is False
+    assert create_call.kwargs["rebind_safe"] is False
 
 
 @pytest.mark.asyncio
