@@ -1717,11 +1717,12 @@ class _HTTPBridgeStreamingMixin:
             stored_count=stored_count_preview,
             stored_fingerprint=stored_fingerprint_preview,
         )
+        session_payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(effective_payload)
         recovery_session_can_anchor = is_http_bridge_account_neutral_replay(
             kind=session.key.affinity_kind,
             key=session.key.affinity_key,
-        ) and (not _http_bridge_payload_looks_like_full_resend(effective_payload) or session_anchor_trimmable)
-        if (
+        ) and (not session_payload_looks_like_full_resend or session_anchor_trimmable)
+        session_anchor_injection_eligible = (
             session.codex_session
             and not proxy_injected_previous_response_id
             and effective_payload.previous_response_id is None
@@ -1735,7 +1736,22 @@ class _HTTPBridgeStreamingMixin:
                 session.last_completed_response_id,
                 _service_time().monotonic(),
             )
-        ):
+        )
+        # A full resend carries its own continuity, so it never takes a
+        # session anchor -- the same policy the durable path applies above.
+        # Trimmability is not a licence to anchor: the trim only proves the
+        # prefix matches what this bridge last stored, never that the anchored
+        # response is still addressable upstream. Prod 2026-08-19: the durable
+        # path skipped a full resend's anchor, the session path then injected
+        # its own and trimmed 50 items to 2, and upstream rejected every one
+        # with 400 ``Invalid previous_response_id``.
+        if session_anchor_injection_eligible and session_payload_looks_like_full_resend:
+            logger.info(
+                "session_anchor_injection_skipped request_id=%s response_id=%s reason=full_resend",
+                request_id,
+                session.last_completed_response_id,
+            )
+        elif session_anchor_injection_eligible:
             fresh_upstream_request_text = text_data
             effective_payload = effective_payload.model_copy(
                 update={"previous_response_id": session.last_completed_response_id}
@@ -2513,9 +2529,12 @@ class _HTTPBridgeStreamingMixin:
                             >= response_create_timeout_seconds
                         ):
                             logger.warning(
-                                "HTTP bridge response.created progress timeout request_id=%s timeout_seconds=%.1f",
+                                "HTTP bridge response.created progress timeout request_id=%s timeout_seconds=%.1f "
+                                "proxy_injected_previous_response_id=%s previous_response_id=%s",
                                 request_state.request_id,
                                 response_create_timeout_seconds,
+                                request_state.proxy_injected_previous_response_id,
+                                request_state.previous_response_id,
                             )
                             if (
                                 request_state.proxy_injected_previous_response_id
@@ -2638,6 +2657,17 @@ class _HTTPBridgeStreamingMixin:
                     param=_websocket_event_error_param(block_event_type, block_payload),
                     message=_websocket_event_error_message(block_event_type, block_payload),
                 ):
+                    # Attribution: an invalid/unknown previous_response_id is
+                    # only ever the client's or ours. Record which, so a
+                    # repeat of the 2026-08-19 lb-injected-anchor 400s is
+                    # answerable from the logs alone.
+                    logger.warning(
+                        "HTTP bridge previous_response_not_found request_id=%s "
+                        "proxy_injected_previous_response_id=%s previous_response_id=%s",
+                        request_state.request_id,
+                        request_state.proxy_injected_previous_response_id,
+                        request_state.previous_response_id,
+                    )
                     session.upstream_control.reconnect_requested = True
                     request_state.error_http_status_override = 502
                     (
@@ -2657,6 +2687,18 @@ class _HTTPBridgeStreamingMixin:
                     and request_state.error_http_status_override is not None
                     and request_state.error_http_status_override >= 400
                 ):
+                    logger.warning(
+                        "HTTP bridge terminal error request_id=%s status=%s error_code=%s "
+                        "proxy_injected_previous_response_id=%s previous_response_id=%s",
+                        request_state.request_id,
+                        request_state.error_http_status_override,
+                        _normalize_error_code(
+                            _websocket_event_error_code(block_event_type, block_payload),
+                            _websocket_event_error_type(block_event_type, block_payload),
+                        ),
+                        request_state.proxy_injected_previous_response_id,
+                        request_state.previous_response_id,
+                    )
                     if request_state.previous_response_not_found_rewritten:
                         raise ProxyResponseError(
                             request_state.error_http_status_override,

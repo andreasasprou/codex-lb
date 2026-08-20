@@ -1453,7 +1453,7 @@ async def test_response_create_gate_timeout_retires_old_precreated_request_after
         (True, False, 25, None, 1),
     ],
 )
-async def test_response_create_gate_timeout_does_not_retire_active_response_progress(
+async def test_response_create_gate_timeout_retires_stuck_gate_holder_by_age(
     monkeypatch: pytest.MonkeyPatch,
     awaiting_response_created: bool,
     downstream_visible: bool,
@@ -1461,6 +1461,13 @@ async def test_response_create_gate_timeout_does_not_retire_active_response_prog
     latency_response_created_ms: int | None,
     response_event_count: int,
 ) -> None:
+    # Zombie eviction is age-based, not flag-based (deployed in
+    # codex-lb:1.22.0-r6.2, prod 2026-08-08). A cleanup race can leave a gate
+    # holder in a flag combination every per-request watchdog ignores while the
+    # semaphore stays taken -- polaris_poc-p6rh: such a holder starved its own
+    # session for 13+ minutes and the old flag-checklist predicate refused to
+    # retire it ten times. Only account-capacity waits stay exempt (covered by
+    # test_response_create_gate_timeout_does_not_retire_account_capacity_wait).
     settings = _make_app_settings(
         proxy_admission_wait_timeout_seconds=0.001,
         http_responses_session_bridge_stuck_gate_retire_after_seconds=300.0,
@@ -1525,8 +1532,8 @@ async def test_response_create_gate_timeout_does_not_retire_active_response_prog
             session.response_create_gate.release()
 
     assert exc_info.value.payload["error"]["code"] == "response_create_gate_timeout"
-    assert retire_calls == []
-    assert session.closed is False
+    assert retire_calls == ["response_create_gate_timeout_stuck_pending"]
+    assert session.closed is True
 
 
 @pytest.mark.asyncio
@@ -19488,6 +19495,7 @@ async def _run_suspect_anchor_stream(
     *,
     full_resend: bool = True,
     session_last_completed: str | None = None,
+    session_stored_prefix_items: int | None = None,
     durable_anchor: bool = True,
 ) -> list[proxy_service.ResponsesRequest]:
     input_items: list[dict[str, Any]] = [
@@ -19535,6 +19543,11 @@ async def _run_suspect_anchor_stream(
     if session_last_completed is not None:
         session.codex_session = True
         session.last_completed_response_id = session_last_completed
+    if session_stored_prefix_items is not None:
+        session.last_completed_input_count = session_stored_prefix_items
+        session.last_completed_input_prefix_fingerprint = proxy_service._fingerprint_input_items(
+            cast(list[Any], input_items[:session_stored_prefix_items])
+        )
 
     async def fake_get_or_create_http_bridge_session(*args: object, **kwargs: object):
         del args, kwargs
@@ -19647,3 +19660,33 @@ async def test_stream_via_http_bridge_skips_suspect_session_anchor(
     )
     assert prepared_payloads
     assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_never_injects_session_anchor_on_full_resend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Prod 2026-08-19: the durable path correctly logged
+    # ``stale_anchor_injection_skipped`` for a full resend, and the
+    # session-level path then injected its own anchor on the same request and
+    # trimmed the payload to the untrimmed suffix (original_items=50
+    # trimmed_to=2). The anchor belonged to a dead upstream connection, so
+    # every such request came back 400 ``Invalid previous_response_id`` --
+    # ~40 client-visible failures in the retained log window, all lb-injected.
+    # A full resend carries its own continuity, so the session path must skip
+    # injection exactly like the durable path does.
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    prepared_payloads = await _run_suspect_anchor_stream(
+        monkeypatch,
+        service,
+        full_resend=True,
+        session_last_completed="resp_session_anchor",
+        session_stored_prefix_items=1,
+        durable_anchor=True,
+    )
+    assert prepared_payloads
+    assert all(prepared.previous_response_id is None for prepared in prepared_payloads)
+    # No anchor means no trim: the client's full history must reach upstream.
+    submitted = prepared_payloads[-1]
+    assert isinstance(submitted.input, list)
+    assert len(submitted.input) == 2
