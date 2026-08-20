@@ -1318,19 +1318,60 @@ class ProxyService(
                     progress_timeout_seconds,
                     timeout_seconds,
                 )
-                should_retire_stuck_session = any(
-                    state.transport == _REQUEST_TRANSPORT_HTTP
-                    and not state.skip_request_log
-                    and state.response_create_gate_acquired
-                    and state.awaiting_response_created
-                    and not state.downstream_visible
-                    and state.latency_response_created_ms is None
-                    and state.response_event_count == 0
-                    and not state.account_capacity_waiting
-                    and state.response_create_sent_at is not None
-                    and max(0.0, now - state.response_create_sent_at) >= threshold_seconds
-                    for state in pending_states
+                # Zombie eviction is age-based, not flag-based. A legitimate
+                # gate hold is bounded by the response.created progress
+                # deadline; the per-request watchdogs all key off request-state
+                # flags (awaiting_response_created / response_create_sent_at /
+                # response_event_count / downstream_visible) and a cleanup race
+                # can leave a holder in a flag combination every watchdog
+                # ignores while the semaphore stays taken (polaris_poc-p6rh:
+                # a holder starved its own session for 13+ minutes while the
+                # old flag-checklist predicate refused to retire it 10 times).
+                # Any pending state still holding the gate past the threshold
+                # is stuck no matter what its flags say; only account-capacity
+                # waits (bounded and logged elsewhere) are exempt.
+                def _gate_held_since(state: "_WebSocketRequestState") -> float:
+                    wait_started = state.response_create_gate_wait_started_at
+                    wait_ms = state.latency_response_create_gate_wait_ms
+                    if wait_started is not None and wait_ms is not None:
+                        return wait_started + wait_ms / 1000.0
+                    if state.response_create_sent_at is not None:
+                        return state.response_create_sent_at
+                    return state.started_at
+
+                gate_holders = [state for state in pending_states if state.response_create_gate_acquired]
+                stuck_holders = [
+                    state
+                    for state in gate_holders
+                    if not state.account_capacity_waiting
+                    and max(0.0, now - _gate_held_since(state)) >= threshold_seconds
+                ]
+                gate_capacity = getattr(response_create_gate, "_value", None)
+                should_retire_stuck_session = bool(stuck_holders) or (
+                    # No pending state owns the gate yet the semaphore has no
+                    # capacity after a full admission-timeout wait: the slot
+                    # leaked on a cleanup path and nothing left can release
+                    # it. Only session teardown recovers the semaphore.
+                    not gate_holders and gate_capacity == 0
                 )
+                for state in stuck_holders:
+                    logger.warning(
+                        "http_bridge_stuck_gate_holder request_id=%s held_seconds=%.1f "
+                        "awaiting_response_created=%s response_create_sent=%s "
+                        "response_event_count=%s downstream_visible=%s "
+                        "latency_response_created_ms=%s account_capacity_waiting=%s "
+                        "skip_request_log=%s transport=%s",
+                        state.request_log_id or state.request_id,
+                        max(0.0, now - _gate_held_since(state)),
+                        state.awaiting_response_created,
+                        state.response_create_sent_at is not None,
+                        state.response_event_count,
+                        state.downstream_visible,
+                        state.latency_response_created_ms,
+                        state.account_capacity_waiting,
+                        state.skip_request_log,
+                        state.transport,
+                    )
             _log_http_bridge_startup_wait_timeout(
                 stage="response_create_gate",
                 timeout_seconds=timeout_seconds,
