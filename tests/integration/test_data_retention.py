@@ -633,6 +633,30 @@ async def test_fold_start_covers_key_only_soft_deleted_history(db_setup):
     assert summary.total_tokens == 150
 
 
+@pytest.mark.asyncio
+async def test_fold_key_start_probe_seeks_the_api_key_index(db_setup):
+    """The key-only start probe runs inside the writer section on every fold
+    pass. It must seek idx_logs_api_key_time per key: walking the
+    requested_at index instead scans the whole table while no row carries a
+    key, stalling every new request for minutes on a large database."""
+    from sqlalchemy import text
+    from sqlalchemy.dialects import sqlite
+
+    from app.modules.accounts.usage_rollup import key_earliest_stmt
+
+    async with SessionLocal() as session:
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name != "sqlite":
+            pytest.skip("SQLite-only query plan test")
+        sql = key_earliest_stmt().compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True})
+        plan_rows = (await session.execute(text(f"EXPLAIN QUERY PLAN {sql}"))).fetchall()
+
+    details = " ".join(str(row[-1]) for row in plan_rows)
+    assert "idx_logs_api_key_time (api_key_id=?)" in details
+    assert "idx_logs_requested_at_id" not in details
+    assert "SCAN request_logs" not in details
+
+
 async def _set_dashboard_retention(*, request_logs: int | None = None, usage_history: int | None = None) -> None:
     from app.core.config.settings_cache import get_settings_cache
     from app.modules.settings.repository import SettingsRepository

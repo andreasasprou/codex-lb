@@ -148,6 +148,25 @@ def api_key_usage_aggregate_stmt(
     )
 
 
+def key_earliest_stmt() -> Select[tuple[datetime]]:
+    """Earliest row the API-key aggregate folds, looked up per existing key so
+    each lookup is one `idx_logs_api_key_time` seek. A table-wide min() over
+    `api_key_id IS NOT NULL` walks the requested_at index row by row and,
+    while few or no rows carry a key, scans the whole table inside the writer
+    section. Rows of deleted keys never fold (the fold skips keys that no
+    longer exist), so they need not anchor the backfill start."""
+    per_key_earliest = (
+        select(func.min(RequestLog.requested_at))
+        .where(
+            RequestLog.api_key_id == ApiKey.id,
+            RequestLog.request_kind.not_in(_EXCLUDED_REQUEST_KINDS),
+        )
+        .correlate(ApiKey)
+        .scalar_subquery()
+    )
+    return select(func.min(per_key_earliest)).select_from(ApiKey)
+
+
 _SUM_COLUMNS = ("request_count", "input_tokens", "output_tokens", "cached_input_tokens", "total_cost_usd")
 
 
@@ -394,14 +413,12 @@ async def _fold_next_slice(session: AsyncSession, target: datetime) -> tuple[_Fo
                 )
             )
         ).scalar_one_or_none()
-        key_earliest = (
-            await session.execute(
-                select(func.min(RequestLog.requested_at)).where(
-                    RequestLog.request_kind.not_in(_EXCLUDED_REQUEST_KINDS),
-                    RequestLog.api_key_id.is_not(None),
-                )
-            )
-        ).scalar_one_or_none()
+        # The least of both only matters when it lies past the watermark, so
+        # once account history reaches back to it (every steady-state pass)
+        # the key probe cannot change the start and is skipped.
+        key_earliest = None
+        if account_earliest is None or account_earliest > start:
+            key_earliest = (await session.execute(key_earliest_stmt())).scalar_one_or_none()
         candidates = [value for value in (account_earliest, key_earliest) if value is not None]
         earliest = min(candidates) if candidates else None
         if earliest is None:
