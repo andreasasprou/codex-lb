@@ -30,14 +30,16 @@ apart across consumers:
   the exact legacy behaviour with no kill switch.
 
 The conversation-presence primitives at the bottom follow the same
-partitioning rule but resolve it INSIDE one statement (the watermark joined
-into both UNION branches) instead of returning raw windows: distinct
-conversation counts must merge folded ids and raw-tail ids in a single
-snapshot, and the raw complement can be phrased watermark-relative as
-``requested_at < ceil_grid(since) OR requested_at >= least(W,
-floor_grid(until))`` — an exact complement of the folded buckets for any
-watermark position, degrading to the full window when the watermark is at
-the epoch (or the state row is missing, via the raw branch's OUTER join).
+partitioning rule but resolve it INSIDE one statement (the watermark read
+from the state row as a scalar subquery in both UNION branches) instead of
+returning raw windows: distinct conversation counts must merge folded ids
+and raw-tail ids in a single snapshot, and the raw complement is two
+UNION ALL branches over constant ranges, ``[since, ceil_grid(since))`` and
+``[greatest(ceil_grid(since), least(W, floor_grid(until))), until)`` — an
+exact complement of the folded buckets for any watermark position that the
+planner serves from the ``requested_at`` index, degrading to the full
+window when the watermark is at the epoch or the state row is missing
+(``coalesce(W, ceil_grid(since))``).
 """
 
 from __future__ import annotations
@@ -230,13 +232,41 @@ def raw_windows_clause(windows: Sequence[RawWindow]) -> ColumnElement[bool]:
 #
 # Distinct conversation counts are not additive across the fold boundary, so
 # the conversation readers merge the folded ids and the raw-tail ids inside
-# ONE statement: the state row is joined into both UNION branches, giving the
-# whole read a single snapshot (a concurrent fold slice or an operator
-# escape-hatch reset can never split the watermark generation between the
-# folded segment and the raw complement). `request_count` rides along for the
-# additive conversation-request totals (each raw row contributes 1).
+# ONE statement. The watermark is read from the state row as an uncorrelated
+# scalar subquery in both UNION branches: the statement still has a single
+# snapshot (a concurrent fold slice or an operator escape-hatch reset can
+# never split the watermark generation between the folded segment and the
+# raw complement), while the planner evaluates the subquery once and can use
+# it as a constant bound on `requested_at` (PostgreSQL InitPlan parameter,
+# SQLite scalar subquery), so the raw branch is a bounded index range instead
+# of a per-row filter over a joined column. `request_count` rides along for
+# the additive conversation-request totals (each raw row contributes 1).
 
 
+def _conversation_watermark_subquery() -> ColumnElement:
+    """The conversation watermark (naive-UTC), NULL when the state row is
+    missing, as a scalar subquery evaluated once per statement."""
+    return (
+        select(AccountUsageRollupState.conversation_folded_through)
+        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
+        .scalar_subquery()
+    )
+
+
+def _conversation_watermark_epoch_subquery(session: AsyncSession) -> ColumnElement:
+    """Epoch seconds of the conversation watermark (whole hours, so the
+    conversion is exact), dialect-split like the bucket expressions."""
+    column = AccountUsageRollupState.conversation_folded_through
+    if session.get_bind().dialect.name == "postgresql":
+        epoch = cast(func.floor(func.extract("epoch", column)), BigInteger)
+    else:
+        epoch = cast(func.strftime("%s", column), Integer)
+    return select(epoch).where(AccountUsageRollupState.id == _STATE_ROW_ID).scalar_subquery()
+
+
+# Kept for the reports per-local-day reads (app/modules/reports/repository.py), which on this
+# branch still use conversation_labeled_presence_union; upstream moved reports to permanent
+# aggregates (#2227) before #2235 removed both, so they stay here verbatim from before #2235.
 def _conversation_watermark_epoch_expr(session: AsyncSession) -> ColumnElement:
     """Epoch seconds of the conversation watermark (whole hours, so the
     conversion is exact), dialect-split like the bucket expressions."""
@@ -251,6 +281,11 @@ def _least_fn(session: AsyncSession):
     return func.least if session.get_bind().dialect.name == "postgresql" else func.min
 
 
+def _greatest_fn(session: AsyncSession):
+    # SQLite's two-argument max() scalar function is its greatest().
+    return func.greatest if session.get_bind().dialect.name == "postgresql" else func.max
+
+
 def _conversation_folded_select(
     session: AsyncSession,
     since: datetime,
@@ -260,9 +295,11 @@ def _conversation_folded_select(
     display_bucket_seconds: int | None,
 ) -> Select:
     rollup = RequestConversationHourlyRollup
+    # `bucket_epoch < NULL` is never true, so a missing state row yields an
+    # empty folded segment (the raw branch then covers the whole window).
     conditions: list[ColumnElement[bool]] = [
         rollup.bucket_epoch >= epoch_seconds(ceil_to_grid(since, HOURLY_BUCKET_SECONDS)),
-        rollup.bucket_epoch < _conversation_watermark_epoch_expr(session),
+        rollup.bucket_epoch < _conversation_watermark_epoch_subquery(session),
     ]
     if until is not None:
         conditions.append(rollup.bucket_epoch < epoch_seconds(floor_to_grid(until, HOURLY_BUCKET_SECONDS)))
@@ -280,53 +317,65 @@ def _conversation_folded_select(
         else:
             display = cast(rollup.bucket_epoch / display_bucket_seconds, Integer) * display_bucket_seconds
         columns.insert(0, display.label("bucket_epoch"))
-    return (
-        select(*columns)
-        .select_from(AccountUsageRollupState)
-        .join(rollup, and_(*conditions))
-        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
-    )
+    return select(*columns).where(and_(*conditions))
 
 
-def _conversation_raw_complement_clause(
-    session: AsyncSession, lo: datetime, hi: datetime | None
-) -> ColumnElement[bool]:
-    """Rows NOT covered by the folded segment ``[lo, min(W, hi))``: below the
-    ceil-grid start, or at/above the watermark-clamped end. A NULL watermark
-    (state row missing — the callers OUTER-join it) or an epoch watermark
-    degrades to the caller's full window."""
-    watermark = AccountUsageRollupState.conversation_folded_through
-    tail_start = watermark if hi is None else _least_fn(session)(watermark, hi)
-    return or_(watermark.is_(None), RequestLog.requested_at < lo, RequestLog.requested_at >= tail_start)
+def _conversation_tail_start(session: AsyncSession, lo: datetime, hi: datetime | None) -> ColumnElement:
+    """Start of the un-folded raw tail, ``greatest(lo, least(coalesce(W, lo),
+    hi))``: the watermark clamped into the folded range ``[lo, hi)``.
+
+    ``W`` is the uncorrelated scalar subquery of the state row and ``lo``/``hi``
+    are literals, so the whole expression is a statement constant (PostgreSQL
+    InitPlan parameter). A NULL watermark (state row missing) coalesces to
+    ``lo`` and an epoch watermark clamps to ``lo``: either way the tail starts
+    at ``lo`` and the raw complement degrades to the caller's full window,
+    exactly like the legacy raw read.
+    """
+    watermark = func.coalesce(_conversation_watermark_subquery(), lo)
+    clamped = watermark if hi is None else _least_fn(session)(watermark, hi)
+    return _greatest_fn(session)(lo, clamped)
 
 
-def _conversation_raw_select(
+def _conversation_raw_selects(
     session: AsyncSession,
     since: datetime,
     until: datetime | None,
     *,
     raw_conditions: Sequence[ColumnElement[bool]],
     display_bucket_seconds: int | None,
-) -> Select:
+) -> list[Select]:
+    """The exact raw complement of the folded segment ``[lo, min(W, hi))``
+    inside ``[since, until)``, as two plain ranges on ``requested_at``: the
+    sub-hour leading edge ``[since, min(lo, until))`` and the un-folded tail
+    ``[tail_start, until)``.
+
+    They are disjoint because ``tail_start >= lo``, and ``tail_start >= lo >=
+    since`` makes ``since`` redundant on the tail. Each branch carries a
+    single lower and a single upper bound so SQLite seeks the
+    ``requested_at`` index to that range; one OR of both ranges ANDed with
+    the window is served by SQLite as the whole window filtered per row (all
+    raw rows in the window read on every dashboard poll). PostgreSQL plans
+    each branch as its own index range as well.
+    """
     lo = ceil_to_grid(since, HOURLY_BUCKET_SECONDS)
     hi = None if until is None else floor_to_grid(until, HOURLY_BUCKET_SECONDS)
-    conditions: list[ColumnElement[bool]] = [
-        RequestLog.requested_at >= since,
-        _conversation_raw_complement_clause(session, lo, hi),
-        conversation_id_expr().is_not(None),
-        *raw_conditions,
-    ]
+    head_end = lo if until is None else min(lo, until)
+    tail_bounds: list[ColumnElement[bool]] = [RequestLog.requested_at >= _conversation_tail_start(session, lo, hi)]
     if until is not None:
-        conditions.append(RequestLog.requested_at < until)
+        tail_bounds.append(RequestLog.requested_at < until)
+    ranges: list[list[ColumnElement[bool]]] = [
+        [RequestLog.requested_at >= since, RequestLog.requested_at < head_end],
+        tail_bounds,
+    ]
     columns: list = [conversation_id_expr().label("cid"), literal(1).label("request_count")]
     if display_bucket_seconds is not None:
         columns.insert(0, _requested_at_epoch_bucket_expr(session, display_bucket_seconds).label("bucket_epoch"))
-    return (
+    return [
         select(*columns)
         .select_from(RequestLog)
-        .outerjoin(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID)
-        .where(and_(*conditions))
-    )
+        .where(and_(*bounds, conversation_id_expr().is_not(None), *raw_conditions))
+        for bounds in ranges
+    ]
 
 
 def conversation_presence_union(
@@ -353,7 +402,7 @@ def conversation_presence_union(
         _conversation_folded_select(
             session, since, until, include_deleted=include_deleted, display_bucket_seconds=display_bucket_seconds
         ),
-        _conversation_raw_select(
+        *_conversation_raw_selects(
             session, since, until, raw_conditions=raw_conditions, display_bucket_seconds=display_bucket_seconds
         ),
     )
