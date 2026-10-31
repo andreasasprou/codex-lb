@@ -4,7 +4,7 @@
 
 The dashboard conversation activity metrics (`conversation_count`, `conversation_request_count`) and hour-multiple conversation trend buckets MUST serve folded history from the conversation presence satellite and the remainder from raw `request_logs` in one statement. The watermark and both UNION branches MUST share a database snapshot: the watermark is read from the state row inside the same statement as an uncorrelated scalar subquery in each branch, never joined into the branches as a column. The raw complement MUST be expressed as bounds on `requested_at` — the sub-hour leading edge below the first folded hour, or the tail at or above the watermark clamped into the window's folded range — so the raw branch is served by bounded index ranges on `requested_at` (two UNION ALL branches, each one index range), never by a per-row filter over a joined watermark column. `COUNT(DISTINCT ...)` MUST deduplicate across the fold boundary. Missing or epoch watermarks MUST degrade to raw reads (the tail start clamps to the first folded hour, so the raw branch covers the whole window). Non-hour-multiple dashboard buckets MUST keep the full-raw path.
 
-Reports summary and daily conversation counts keep their raw-bound reads on this branch (`conversation_labeled_presence_union`); permanent report history is not provided here.
+Reports conversation counts are unchanged by this change on this branch: they keep combining folded presence with raw rows through the existing helpers (`conversation_presence_union` for unfiltered summaries, `conversation_labeled_presence_union` for daily counts), and this branch provides no permanent report history, so filtered report results do not survive raw pruning.
 
 #### Scenario: Switched conversation reads equal legacy reads while raw exists
 
@@ -31,18 +31,6 @@ Reports summary and daily conversation counts keep their raw-bound reads on this
 - **GIVEN** folded conversation presence whose source raw rows have been pruned by retention
 - **WHEN** the dashboard conversation activity metrics or hour-multiple conversation trend buckets are read over that period
 - **THEN** the distinct-conversation values equal those reported before the pruning (modulo the documented sub-bucket window edges)
-
-#### Scenario: Filtered reports reads stay raw-bound
-
-- **GIVEN** a filtered report and a missing or epoch report-fold watermark
-- **WHEN** the read executes
-- **THEN** it uses only raw rows until the report fold has covered history
-
-#### Scenario: Filtered reports preserve folded history
-
-- **GIVEN** a report filtered by account, API key, model or User-Agent and a completed report fold
-- **WHEN** source raw rows are pruned
-- **THEN** report totals, distinct conversations and daily buckets remain available from the report history source
 
 #### Scenario: Non-hour-multiple conversation buckets degrade to full raw
 
