@@ -31,3 +31,18 @@ def test_unknown_plan_matching_is_case_insensitive_and_trims_account_value():
 
 def test_unknown_plan_blocked_when_not_explicitly_allowed():
     assert account_plan_matches_allowed("future_plan", frozenset({"plus"})) is False
+
+
+def test_pool_plan_type_reports_promax_below_pro_and_above_lower_plans() -> None:
+    from types import SimpleNamespace
+    from typing import cast
+
+    from app.db.models import Account
+    from app.modules.proxy.helpers import _plan_type_for_accounts
+
+    def pool(*plans: str) -> list[Account]:
+        return [cast(Account, SimpleNamespace(plan_type=plan)) for plan in plans]
+
+    assert _plan_type_for_accounts(pool("pro", "promax")) == "pro"
+    assert _plan_type_for_accounts(pool("promax", "prolite")) == "promax"
+    assert _plan_type_for_accounts(pool("promax", "plus")) == "promax"

@@ -1,3 +1,8 @@
+> **Backport note (branch `local/1.24.0-beta.4-r5`):** this branch does not carry `report-aggregation`
+> (#2227). Reports still read raw rows through `conversation_labeled_presence_union`, which is kept, so
+> the reports statements below do not hold here. The raw complement is two UNION ALL ranges rather than
+> one OR, because SQLite serves the OR form as a window-wide per-row filter.
+
 # Change: bound-conversation-raw-tail-index-range
 
 ## Why

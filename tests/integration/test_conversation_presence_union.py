@@ -15,9 +15,9 @@ union itself:
    sub-hour edges and the un-folded tail for every watermark layout (below,
    at the window start, inside, at the window end, above).
 
-The reports' conversation counts are served by the permanent report
-aggregates (``app/modules/reports/rollup_read.py``) and are pinned by the
-reports tests, not here.
+On this branch the reports' conversation counts still read raw rows through
+``conversation_labeled_presence_union`` and are pinned by the reports tests,
+not here.
 """
 
 from __future__ import annotations
@@ -319,9 +319,8 @@ async def test_conversation_statements_read_watermark_as_scalar_subquery(db_setu
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", _capture)
 
-    # The reports repository reads its conversation counts from the permanent
-    # report aggregates, so the only switched conversation reads are the two
-    # dashboard ones: activity metrics and hour-multiple trend buckets.
+    # Only the two dashboard conversation reads run here: activity metrics and
+    # hour-multiple trend buckets (the reports read is pinned by the reports tests).
     union_statements = [stmt for stmt in statements if "request_conversation_hourly_rollups" in stmt]
     assert len(union_statements) == 2, "expected one merged statement per switched conversation read"
     for stmt in union_statements:

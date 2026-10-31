@@ -23,6 +23,7 @@ PLAN_TYPE_PRIORITY = (
     "business",
     "team",
     "pro",
+    "promax",
     "plus",
     "education",
     "edu",
