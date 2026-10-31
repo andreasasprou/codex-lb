@@ -264,6 +264,18 @@ def _conversation_watermark_epoch_subquery(session: AsyncSession) -> ColumnEleme
     return select(epoch).where(AccountUsageRollupState.id == _STATE_ROW_ID).scalar_subquery()
 
 
+# Kept for the reports per-local-day reads (app/modules/reports/repository.py), which on this
+# branch still use conversation_labeled_presence_union; upstream moved reports to permanent
+# aggregates (#2227) before #2235 removed both, so they stay here verbatim from before #2235.
+def _conversation_watermark_epoch_expr(session: AsyncSession) -> ColumnElement:
+    """Epoch seconds of the conversation watermark (whole hours, so the
+    conversion is exact), dialect-split like the bucket expressions."""
+    column = AccountUsageRollupState.conversation_folded_through
+    if session.get_bind().dialect.name == "postgresql":
+        return cast(func.floor(func.extract("epoch", column)), BigInteger)
+    return cast(func.strftime("%s", column), Integer)
+
+
 def _least_fn(session: AsyncSession):
     # SQLite's two-argument min() scalar function is its least().
     return func.least if session.get_bind().dialect.name == "postgresql" else func.min
@@ -391,6 +403,69 @@ def conversation_presence_union(
             session, since, until, raw_conditions=raw_conditions, display_bucket_seconds=display_bucket_seconds
         ),
     )
+
+
+def conversation_labeled_presence_union(
+    session: AsyncSession,
+    windows: Sequence[tuple[str, datetime, datetime]],
+    *,
+    raw_conditions: Sequence[ColumnElement[bool]] = (),
+) -> CompoundSelect:
+    """``(label, cid)`` UNION ALL rows over labeled half-open windows (the
+    reports per-local-day ranges, whose bounds need not be hour-aligned).
+
+    Soft-deleted rows are included on both sides — the reports conversation
+    reads carry no ``deleted_at`` filter. Callers group by label and count
+    ``DISTINCT cid``; windows are expected pre-batched below the SQLite
+    compound-select limit (the reports repository already batches at 500).
+    """
+    window_rows = [
+        select(
+            literal(label).label("label"),
+            literal(start).label("window_start"),
+            literal(end).label("window_end"),
+            literal(ceil_to_grid(start, HOURLY_BUCKET_SECONDS)).label("fold_lo_at"),
+            literal(floor_to_grid(end, HOURLY_BUCKET_SECONDS)).label("fold_hi_at"),
+            literal(epoch_seconds(ceil_to_grid(start, HOURLY_BUCKET_SECONDS))).label("fold_lo_epoch"),
+            literal(epoch_seconds(floor_to_grid(end, HOURLY_BUCKET_SECONDS))).label("fold_hi_epoch"),
+        )
+        for label, start, end in windows
+    ]
+    windows_cte = (window_rows[0] if len(window_rows) == 1 else union_all(*window_rows)).cte("conversation_windows")
+    rollup = RequestConversationHourlyRollup
+    folded = select(windows_cte.c.label, rollup.conversation_id.label("cid")).select_from(
+        windows_cte.join(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID).join(
+            rollup,
+            and_(
+                rollup.bucket_epoch >= windows_cte.c.fold_lo_epoch,
+                rollup.bucket_epoch < windows_cte.c.fold_hi_epoch,
+                rollup.bucket_epoch < _conversation_watermark_epoch_expr(session),
+            ),
+        )
+    )
+    watermark = AccountUsageRollupState.conversation_folded_through
+    raw = (
+        select(windows_cte.c.label, conversation_id_expr().label("cid"))
+        .select_from(
+            windows_cte.join(
+                RequestLog,
+                and_(
+                    RequestLog.requested_at >= windows_cte.c.window_start,
+                    RequestLog.requested_at < windows_cte.c.window_end,
+                    conversation_id_expr().is_not(None),
+                    *raw_conditions,
+                ),
+            ).outerjoin(AccountUsageRollupState, AccountUsageRollupState.id == _STATE_ROW_ID)
+        )
+        .where(
+            or_(
+                watermark.is_(None),
+                RequestLog.requested_at < windows_cte.c.fold_lo_at,
+                RequestLog.requested_at >= _least_fn(session)(watermark, windows_cte.c.fold_hi_at),
+            )
+        )
+    )
+    return union_all(folded, raw)
 
 
 async def earliest_hourly_bucket_at(session: AsyncSession) -> datetime | None:
