@@ -469,3 +469,24 @@ async def test_conversation_union_raw_branch_is_index_bounded_postgresql(db_setu
     await _fold_through(_PLAN_W)
     await _analyze()
     await _probe(layouts_high, _PLAN_W)
+
+
+@pytest.mark.asyncio
+async def test_conversation_union_raw_branch_is_index_bounded_sqlite(db_setup):
+    """SQLite serves one OR of the two raw ranges ANDed with the window as the
+    whole window filtered per row, so the raw complement must be two UNION ALL
+    branches, each a single index range on requested_at."""
+    async with SessionLocal() as session:
+        if _dialect_name(session) != "sqlite":
+            pytest.skip("SQLite-only query plan test")
+        since, until = WINDOWS[0]
+        assert until is not None
+        statement = _union_stmt(session, since, until)
+        sql = str(statement.compile(dialect=session.get_bind().dialect, compile_kwargs={"literal_binds": True}))
+        connection = await session.connection()
+        plan = [row[3] for row in (await connection.exec_driver_sql(f"EXPLAIN QUERY PLAN {sql}")).all()]
+    request_log_steps = [step for step in plan if "request_logs" in step]
+    assert len(request_log_steps) == 2, plan
+    for step in request_log_steps:
+        assert step.startswith("SEARCH request_logs USING"), plan
+        assert "requested_at>" in step and "requested_at<" in step, plan

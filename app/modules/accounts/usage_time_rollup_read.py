@@ -33,10 +33,10 @@ The conversation-presence primitives at the bottom follow the same
 partitioning rule but resolve it INSIDE one statement (the watermark read
 from the state row as a scalar subquery in both UNION branches) instead of
 returning raw windows: distinct conversation counts must merge folded ids
-and raw-tail ids in a single snapshot, and the raw complement is phrased as
-two constant ranges ``requested_at < ceil_grid(since) OR requested_at >=
-greatest(ceil_grid(since), least(W, floor_grid(until)))`` — an exact
-complement of the folded buckets for any watermark position that the
+and raw-tail ids in a single snapshot, and the raw complement is two
+UNION ALL branches over constant ranges, ``[since, ceil_grid(since))`` and
+``[greatest(ceil_grid(since), least(W, floor_grid(until))), until)`` — an
+exact complement of the folded buckets for any watermark position that the
 planner serves from the ``requested_at`` index, degrading to the full
 window when the watermark is at the epoch or the state row is missing
 (``coalesce(W, ceil_grid(since))``).
@@ -336,43 +336,46 @@ def _conversation_tail_start(session: AsyncSession, lo: datetime, hi: datetime |
     return _greatest_fn(session)(lo, clamped)
 
 
-def _conversation_raw_complement_clause(
-    session: AsyncSession, lo: datetime, hi: datetime | None
-) -> ColumnElement[bool]:
-    """Rows NOT covered by the folded segment ``[lo, min(W, hi))``: below the
-    ceil-grid start, or at/above the tail start.
-
-    Both bounds are statement constants (``lo``/``hi`` literals, ``W`` an
-    uncorrelated scalar subquery), so PostgreSQL plans the OR as a BitmapOr of
-    two index ranges on ``requested_at`` — never a per-row test of a joined
-    column. The constant bounds are load-bearing: PostgreSQL applies an OR
-    whose bounds come from a joined row as a per-row filter instead.
-    """
-    return or_(RequestLog.requested_at < lo, RequestLog.requested_at >= _conversation_tail_start(session, lo, hi))
-
-
-def _conversation_raw_select(
+def _conversation_raw_selects(
     session: AsyncSession,
     since: datetime,
     until: datetime | None,
     *,
     raw_conditions: Sequence[ColumnElement[bool]],
     display_bucket_seconds: int | None,
-) -> Select:
+) -> list[Select]:
+    """The exact raw complement of the folded segment ``[lo, min(W, hi))``
+    inside ``[since, until)``, as two plain ranges on ``requested_at``: the
+    sub-hour leading edge ``[since, min(lo, until))`` and the un-folded tail
+    ``[tail_start, until)``.
+
+    They are disjoint because ``tail_start >= lo``, and ``tail_start >= lo >=
+    since`` makes ``since`` redundant on the tail. Each branch carries a
+    single lower and a single upper bound so SQLite seeks the
+    ``requested_at`` index to that range; one OR of both ranges ANDed with
+    the window is served by SQLite as the whole window filtered per row (all
+    raw rows in the window read on every dashboard poll). PostgreSQL plans
+    each branch as its own index range as well.
+    """
     lo = ceil_to_grid(since, HOURLY_BUCKET_SECONDS)
     hi = None if until is None else floor_to_grid(until, HOURLY_BUCKET_SECONDS)
-    conditions: list[ColumnElement[bool]] = [
-        RequestLog.requested_at >= since,
-        _conversation_raw_complement_clause(session, lo, hi),
-        conversation_id_expr().is_not(None),
-        *raw_conditions,
-    ]
+    head_end = lo if until is None else min(lo, until)
+    tail_bounds: list[ColumnElement[bool]] = [RequestLog.requested_at >= _conversation_tail_start(session, lo, hi)]
     if until is not None:
-        conditions.append(RequestLog.requested_at < until)
+        tail_bounds.append(RequestLog.requested_at < until)
+    ranges: list[list[ColumnElement[bool]]] = [
+        [RequestLog.requested_at >= since, RequestLog.requested_at < head_end],
+        tail_bounds,
+    ]
     columns: list = [conversation_id_expr().label("cid"), literal(1).label("request_count")]
     if display_bucket_seconds is not None:
         columns.insert(0, _requested_at_epoch_bucket_expr(session, display_bucket_seconds).label("bucket_epoch"))
-    return select(*columns).select_from(RequestLog).where(and_(*conditions))
+    return [
+        select(*columns)
+        .select_from(RequestLog)
+        .where(and_(*bounds, conversation_id_expr().is_not(None), *raw_conditions))
+        for bounds in ranges
+    ]
 
 
 def conversation_presence_union(
@@ -399,7 +402,7 @@ def conversation_presence_union(
         _conversation_folded_select(
             session, since, until, include_deleted=include_deleted, display_bucket_seconds=display_bucket_seconds
         ),
-        _conversation_raw_select(
+        *_conversation_raw_selects(
             session, since, until, raw_conditions=raw_conditions, display_bucket_seconds=display_bucket_seconds
         ),
     )
