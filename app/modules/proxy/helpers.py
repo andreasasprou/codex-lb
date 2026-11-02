@@ -38,7 +38,17 @@ PLAN_TYPE_PRIORITY = (
 _RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "usage_limit_reached"})
 _QUOTA_CODES = frozenset({"insufficient_quota", "usage_not_included", "quota_exceeded"})
 _TRANSIENT_CODES = frozenset(
-    {"server_error", "upstream_error", "stream_incomplete", "overloaded_error", "server_is_overloaded"}
+    {
+        "server_error",
+        "upstream_error",
+        "stream_incomplete",
+        "overloaded_error",
+        "server_is_overloaded",
+        # 429 "Codex is at capacity, please try again later": a short per-account
+        # throttle, not a usage-window limit, so fail over without marking the
+        # account rate-limited.
+        "turn_rate_limit_exceeded",
+    }
 )
 _MODEL_CAPACITY_MESSAGE_MARKERS = ("selected model is at capacity",)
 

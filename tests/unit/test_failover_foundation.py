@@ -117,6 +117,23 @@ class TestClassifyUpstreamFailure:
         )
         assert result["failure_class"] == "retryable_transient"
 
+    def test_turn_rate_limit_exceeded_fails_over(self) -> None:
+        result = classify_upstream_failure(
+            error_code="turn_rate_limit_exceeded",
+            error=UpstreamError(message="Codex is at capacity, please try again later"),
+            http_status=429,
+            phase="first_event",
+        )
+        assert result["failure_class"] == "retryable_transient"
+        assert (
+            failover_decision(
+                failure_class=result["failure_class"],
+                downstream_visible=False,
+                candidates_remaining=1,
+            )
+            == "failover_next"
+        )
+
     def test_selected_model_capacity_message(self) -> None:
         result = classify_upstream_failure(
             error_code="invalid_request_error",
